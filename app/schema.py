@@ -80,6 +80,10 @@ class SourceItem(BaseModel):
     notes: str = ""  # ORACLE — not for the pipeline
     provenance: Provenance
     content_hash: str = ""
+    # Canonical item id when this item is an exact/near duplicate of another. The
+    # duplicate is retained in full for provenance; extraction/counts run over
+    # canonicals only, so copies never inflate totals. Set by the dedup stage.
+    duplicate_of: Optional[str] = None
 
     @property
     def senders(self) -> list[Participant]:

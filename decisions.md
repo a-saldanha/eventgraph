@@ -201,3 +201,44 @@ present. Recorded here because it is a real limitation, not a silent one.
 - A bare `Mumbai` still appeared as a person after the first pass — it was the trailing
   location on a PDF issuer line. Fixed by parsing issuers as a single org with the
   location as a descriptor.
+
+## Phase 2 — identity, owner, and applied dedup
+
+### D2.1 — `duplicate_of` on the item, extraction over canonicals only
+**Chose:** the dedup stage stamps each copy with `SourceItem.duplicate_of = <canonical id>`
+(exact groups take priority over near-dup clusters), and `build_graph` runs relevance,
+entity extraction, money, and people resolution over the *canonical* items only. Every
+duplicate is still retained in full in the bundle for provenance.
+**Alternatives:** drop duplicates at ingestion; dedup only at query/aggregation time.
+**Reasoning:** the brief's named failure is a forwarded invoice inflating a "trip cost"
+total. Counting over canonicals makes that structural — a forwarded/near-duplicate item is
+marked `duplicate_of` and never contributes a second mention — while keeping the copy so a
+citation can still point at the exact forwarded message. Verified: of 1,482 items, 438 are
+marked duplicates (1,044 canonical, matching `unique_after_dedup`), and **zero** entity
+mentions land on a duplicate item.
+**Cut:** removing duplicates from storage (provenance would be lost).
+
+### D2.2 — Structural owner inference wired into people resolution
+**Chose:** before people resolution, build the deterministic identity index
+(`resolve/identity.py`, same-email/phone must-links) and infer the archive owner
+(`resolve/owner.py`, by cross-channel reach — conversations, channels, recipient hits,
+self-markers, WhatsApp export presence). The resulting owner participant refs are
+force-unioned into one person entity in `entities.resolve_people`, flagged `attrs.owner`,
+and labelled from the owner's real name.
+**Alternatives:** merge the owner by name/leet similarity like any other person; treat the
+calendar "self" marker and WhatsApp handle as separate people.
+**Reasoning:** the owner appears as four email addresses, a leetspeak WhatsApp handle
+(`A!@n`, parsed `kind="unknown"`), and a calendar `self` marker — surfaces that share **no**
+identifier, so identifier- and name-based ER structurally cannot join them. Structural
+inference (who the archive is *shaped around*) can. `A!@n` and the self-marker are owner-
+unique, so force-unioning them pulls in no other person. Result: the owner collapses from
+three entities into one across `email + excel_row + pdf + whatsapp`; `graph_report` now
+reports a real owner instead of the "most-mentioned person" fallback.
+**Cut:** name-similarity as an owner signal (explicitly avoided — a handle shares no name).
+
+### Before / after (`graph_report --build`, heuristic)
+- Owner: `unknown` most-mentioned fallback across `whatsapp+pdf`, split from `Alan Saldanha`
+  (email+pdf) and the calendar self-marker → **one** `Alan Saldanha` entity across
+  `email, excel_row, pdf, whatsapp`.
+- Extraction now runs over 1,044 canonicals (was all 1,482); duplicates no longer inflate
+  mentions/counts. 15/15 tests still pass.

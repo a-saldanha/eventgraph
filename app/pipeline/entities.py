@@ -37,22 +37,32 @@ _MONEY_RE = re.compile(r"\$\s?([0-9][0-9,]*\.[0-9]{2})")
 
 
 # ----------------------------------------------------------------------------- extraction
-def _people_mentions(items: list[SourceItem]):
-    """(display_name, email, item_id, surface_text) from typed person participants.
+def _people_mentions(items: list[SourceItem], owner_refs: set | None = None):
+    """(display_name, email, item_id, surface_text) from typed person participants,
+    plus the index set of mentions that belong to the archive owner.
 
     Only participants the parser classified as people are considered, so
-    placeholders, group titles, role mailboxes and org issuers never become people.
+    placeholders, group titles, role mailboxes and org issuers never become people —
+    *except* participants whose (item_id, index) is in `owner_refs`. Those are the
+    owner's own cross-channel surfaces (a calendar "self" marker, a WhatsApp leet
+    handle) that carry no shared identifier; they are folded into the one owner
+    entity by a forced union, never surfaced as separate people.
     """
+    owner_refs = owner_refs or set()
     out = []
+    owner_idx: set[int] = set()
     for it in items:
-        for p in it.participants:
-            if p.kind != "person":
+        for pi, p in enumerate(it.participants):
+            is_owner = (it.id, pi) in owner_refs
+            if p.kind != "person" and not is_owner:
                 continue
             email = p.id_value if p.id_type == "email" else ""
             name = p.display_name or (p.id_value if p.id_type == "phone" else "")
             surface = p.raw or name or email or ""
+            if is_owner:
+                owner_idx.add(len(out))
             out.append((name or "", email or "", it.id, surface))
-    return out
+    return out, owner_idx
 
 
 def _leet_norm(name: str) -> str:
@@ -84,13 +94,28 @@ class _UF:
             self.p[ra] = rb
 
 
-def resolve_people(items: list[SourceItem]) -> tuple[list[Entity], list[MergeRecord]]:
-    return resolve_person_mentions(_people_mentions(items))
+def resolve_people(
+    items: list[SourceItem],
+    owner_refs: set | None = None,
+    owner_label: str | None = None,
+) -> tuple[list[Entity], list[MergeRecord]]:
+    raw, owner_idx = _people_mentions(items, owner_refs)
+    return resolve_person_mentions(raw, owner_idx=owner_idx, owner_label=owner_label)
 
 
-def resolve_person_mentions(raw) -> tuple[list[Entity], list[MergeRecord]]:
+def resolve_person_mentions(
+    raw,
+    owner_idx: set[int] | None = None,
+    owner_label: str | None = None,
+) -> tuple[list[Entity], list[MergeRecord]]:
     """Core entity resolution over (name, email, item_id, surface) tuples — shared
-    by the header-based (heuristic) and LLM extraction paths."""
+    by the header-based (heuristic) and LLM extraction paths.
+
+    `owner_idx` names the mentions that structural owner inference tied to the
+    archive owner; they are force-unioned into one entity (flagged `owner`) so the
+    owner's email, leet handle and calendar-self surfaces collapse even though they
+    share no identifier."""
+    owner_idx = owner_idx or set()
     # index each mention by a stable key
     keys = list(range(len(raw)))
     uf = _UF(keys)
@@ -117,6 +142,10 @@ def resolve_person_mentions(raw) -> tuple[list[Entity], list[MergeRecord]]:
     for group in by_name.values():
         for j in group[1:]:
             uf.union(group[0], j)
+    # collapse every owner surface into one identity, across channels
+    owner_members = sorted(owner_idx)
+    for j in owner_members[1:]:
+        uf.union(owner_members[0], j)
 
     # assemble canonical entities
     clusters: dict[int, list[int]] = defaultdict(list)
@@ -126,15 +155,19 @@ def resolve_person_mentions(raw) -> tuple[list[Entity], list[MergeRecord]]:
     entities: list[Entity] = []
     merges: list[MergeRecord] = []
     for ci, (root, members) in enumerate(clusters.items()):
+        is_owner = bool(owner_idx.intersection(members))
         names = [raw[i][0] for i in members if raw[i][0]]
         emails = sorted({raw[i][1] for i in members if raw[i][1]})
         surfaces = sorted({raw[i][3] for i in members})
-        label = _best_label(names, emails)
+        label = owner_label if (is_owner and owner_label) else _best_label(names, emails)
         eid = f"person:{ci}"
         mentions = [Mention(item_id=raw[i][2], text=raw[i][3]) for i in members]
+        attrs = {"emails": emails}
+        if is_owner:
+            attrs["owner"] = True
         entities.append(Entity(
             id=eid, type=EntityType.PERSON, label=label,
-            aliases=surfaces, mentions=mentions, attrs={"emails": emails},
+            aliases=surfaces, mentions=mentions, attrs=attrs,
         ))
         if len(surfaces) > 1:
             why = []
@@ -147,6 +180,8 @@ def resolve_person_mentions(raw) -> tuple[list[Entity], list[MergeRecord]]:
             norm_names = {_leet_norm(n) for n in names if n}
             if len(names) > 1 and len(norm_names) == 1 and any(n != names[0] for n in names):
                 why.append("name variants match after leet/normalization")
+            if is_owner:
+                why.append("owner surfaces across channels collapsed by structural inference")
             merges.append(MergeRecord(
                 canonical_id=eid, merged_forms=surfaces[:12],
                 rationale="; ".join(why) or "grouped by shared identifiers",

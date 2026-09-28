@@ -33,19 +33,36 @@ class Bundle:
 def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None) -> Bundle:
     mark_shared_mailboxes(items)  # downgrade addresses used by 3+ names to system
     dedup = find_duplicates(items)
+    # Stamp each duplicate with its canonical id, then run every downstream stage
+    # over canonicals only. Copies stay in `items` (full provenance) but no longer
+    # inflate counts, money totals, or relevance — a forwarded invoice is a dup, so
+    # its amount is counted once.
+    _mark_duplicates(items, dedup)
+    canon_items = [it for it in items if not it.duplicate_of]
 
     if mode == "llm":
-        relevance, llm_ents = _llm_stage(items, progress)
+        relevance, llm_ents = _llm_stage(canon_items, progress)
     else:
-        relevance, llm_ents = score_relevance(items), None
+        relevance, llm_ents = score_relevance(canon_items), None
 
     relevant_ids = {v.item_id for v in relevance if v.relevant}
-    rel_items = [it for it in items if it.id in relevant_ids] or items
+    rel_items = [it for it in canon_items if it.id in relevant_ids] or canon_items
+
+    # Deterministic identity must-links + structural owner inference, before people
+    # resolution. The owner's email identity, WhatsApp leet handle and calendar-self
+    # marker share no identifier, so structural inference (reach across channels) is
+    # what collapses them into one owner entity.
+    from ..resolve.identity import build_identity_index
+    from ..resolve.owner import infer_owner
+    identity = build_identity_index(canon_items)
+    owner = infer_owner(canon_items, identity)
 
     # People + their correspondence come from message HEADERS in both modes — this
     # is deterministic and data-independent, so the social graph always connects.
     # The LLM (when on) contributes the harder, content-derived entity types.
-    people, merges = E.resolve_people(rel_items)
+    people, merges = E.resolve_people(
+        rel_items, owner_refs=set(owner.refs), owner_label=owner.label
+    )
     if llm_ents is not None:
         orgs = _group_llm(llm_ents["org"], EntityType.ORG, "org")
         locations = _group_llm(llm_ents["location"], EntityType.LOCATION, "loc")
@@ -67,12 +84,22 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
     graph = EventGraph(entities=all_entities, edges=edges, merges=merges, relevance=relevance)
     timeline = _timeline(subevents, items)
     stats = {
-        "items": len(items), "relevant_items": len(relevant_ids),
+        "items": len(items), "canonical_items": len(canon_items),
+        "relevant_items": len(relevant_ids),
         "exact_dupes": dedup.n_exact_dupes, "near_dupes": dedup.n_near_dupes,
         "entities": len(all_entities), "edges": len(edges),
         "people": len(people), "merges": len(merges), "mode": mode,
+        "owner": owner.label, "owner_confident": owner.confident,
     }
     return Bundle(items=items, dedup=dedup, graph=graph, timeline=timeline, stats=stats)
+
+
+def _mark_duplicates(items: list[SourceItem], dedup: DedupResult) -> None:
+    """Stamp `duplicate_of` on every item that is a copy of an earlier one, using the
+    dedup canonical map (exact groups take priority over near-dup clusters)."""
+    for it in items:
+        canon = dedup.canonical.get(it.id)
+        it.duplicate_of = canon if (canon and canon != it.id) else None
 
 
 # --------------------------------------------------------------------------- LLM stage
