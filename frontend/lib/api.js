@@ -21,7 +21,13 @@ export const api = {
   item: (id) => j(`/api/item/${encodeURIComponent(id)}`),
   entity: (id) => j(`/api/entity/${encodeURIComponent(id)}`),
   query: (id) => j(`/api/query/${id}`),
-  ask: (q) => j(`/api/ask?q=${encodeURIComponent(q)}`),
+  ask: async (q) => {
+    const r = await fetch(`${API_BASE}/api/ask?q=${encodeURIComponent(q)}`);
+    if (r.status === 503) return r.json();  // return 503 body (error object) instead of throwing
+    if (!r.ok) throw new Error(`${r.status}`);
+    return r.json();
+  },
+  starterQuestions: () => j("/api/starter_questions"),
   currencyFlags: () => j("/api/flags/currency"),
   resolveCurrency: async (entityId, currency) => {
     const r = await fetch(

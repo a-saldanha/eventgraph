@@ -1,26 +1,21 @@
-"""Canned cross-source queries — the 'why a graph beats flat RAG' proof.
+"""Parameterized query types — the 'why a graph beats flat RAG' proof.
 
-Each returns a structured answer with citations (item ids) and a sub-graph to
-highlight. Deterministic over the built graph; an LLM query planner would replace
-`run` while keeping this shape.
+Each returns a structured answer with citations, table/steps, subgraph, caveats.
+Deterministic over the built graph; query-time topic scoping is via item_topics on Bundle.
 """
 from __future__ import annotations
 
-from datetime import timezone
-
 from .pipeline.build import Bundle
 
-QUERIES = [
-    {"id": "trip_cost", "q": "What did the trip cost, and what was each payment for?"},
-    {"id": "visa_timeline", "q": "Show me everything about the visa, in order."},
-    {"id": "correspondents", "q": "Who did I correspond with about the conference?"},
-    {"id": "timeline", "q": "What happened between acceptance and the trip, in order?"},
-    {"id": "sick_control", "q": "Was I sick during the trip? (negative control — noise handling)"},
+QUERY_TYPES = [
+    {"id": "money", "q": "What are the financial amounts and costs?"},
+    {"id": "timeline", "q": "Show the timeline of events in order."},
+    {"id": "who", "q": "Who are the key people involved?"},
 ]
 
 
 def list_queries():
-    return QUERIES
+    return QUERY_TYPES
 
 
 def _cite(b: Bundle, item_ids, k=8):
@@ -35,128 +30,169 @@ def _cite(b: Bundle, item_ids, k=8):
 
 
 def run(query_id: str, b: Bundle) -> dict:
+    if query_id not in _HANDLERS:
+        raise KeyError(query_id)
     return _HANDLERS[query_id](b)
 
 
-def _trip_cost(b: Bundle) -> dict:
-    from collections import defaultdict
-    from .pipeline import currency as C
-
-    money = [e for e in b.graph.entities if e.type.value == "money"]
-    by_cur: dict = defaultdict(list)
+def money(b: Bundle) -> dict:
+    """Return all money entities, split into resolved vs flagged (no currency marker)."""
+    money_ents = [e for e in b.graph.entities if e.type.value == "money"]
+    resolved = []
     flagged = []
-    for m in money:
+    for m in money_ents:
         if m.attrs.get("needs_review") or not m.attrs.get("currency"):
             flagged.append(m)
         else:
-            by_cur[m.attrs["currency"]].append(m)
+            resolved.append(m)
 
-    groups = []
-    for cur, ms in sorted(by_cur.items()):
-        ms.sort(key=lambda e: -e.attrs["amount"])
-        amounts = [e.attrs["amount"] for e in ms]
-        largest = max(amounts)
-        comp_sum = sum(a for a in amounts if 0 < a < largest)
-        groups.append({
-            "currency": cur, "symbol": C.SYMBOL_OF.get(cur, cur),
-            "largest": largest, "components_sum": comp_sum,
-            "rows": [{"amount": e.label, "evidence_items": len(e.item_ids)} for e in ms],
+    table = []
+    for m in sorted(resolved, key=lambda e: -e.attrs.get("amount", 0)):
+        table.append({
+            "amount": m.label,
+            "currency": m.attrs.get("currency", ""),
+            "label": m.label,
+            "sources": len(m.item_ids),
+            "flagged": False,
+        })
+    for m in sorted(flagged, key=lambda e: -e.attrs.get("amount", 0)):
+        table.append({
+            "amount": f'{m.attrs.get("amount", 0):,.2f}',
+            "currency": "?",
+            "label": m.label,
+            "sources": len(m.item_ids),
+            "flagged": True,
         })
 
-    flag_rows = [{"amount": f'{e.attrs["amount"]:,.2f}', "entity_id": e.id,
-                  "why": "mixed-currency" if e.attrs.get("currency_ambiguous") else "no currency marker in source"}
-                 for e in sorted(flagged, key=lambda e: -e.attrs["amount"])]
+    n_resolved = len(resolved)
+    n_flagged = len(flagged)
+    answer = (
+        f"{n_resolved} amount(s) resolved"
+        + (f"; {n_flagged} amount(s) flagged (no currency marker, excluded from totals)" if n_flagged else "")
+    ) if money_ents else "No financial amounts found."
 
-    parts = [f'{g["symbol"]}{g["largest"]:,.2f} ({g["currency"]})' for g in groups]
-    answer = "Costs span multiple currencies: " + ", ".join(parts) if parts else "No resolved amounts."
-    note = (
-        "Amounts are grouped by the currency actually found in the source — never assumed. "
-        f"{len(flag_rows)} amount(s) carried NO currency marker (e.g. bare WhatsApp numbers) and are "
-        "FLAGGED for you to resolve; they are excluded from every total until you do. "
-        "Within the USD invoice, the largest is the registration total and the smaller amounts are its "
-        "line-item components (summing all would double-count)."
+    caveats = (
+        ["Amounts with no currency marker are excluded from totals and labelled partial."]
+        if n_flagged else []
     )
-    cites = _cite(b, sorted({i for m in money for i in m.item_ids}))
-    return {"question": QUERIES[0]["q"], "answer": answer,
-            "groups": groups, "flagged": flag_rows, "note": note, "citations": cites,
-            "subgraph": [m.id for m in money] + [e.id for e in b.graph.entities if e.type.value == "org"][:2]}
+
+    all_ids = sorted({i for m in money_ents for i in m.item_ids})
+    return {
+        "answer": answer,
+        "answer_parts": [answer],
+        "table": table,
+        "caveats": caveats,
+        "citations": _cite(b, all_ids),
+        "subgraph": [m.id for m in money_ents],
+    }
 
 
-def _subevent(b: Bundle, label: str):
-    return next((e for e in b.graph.entities if e.type.value == "subevent" and e.label == label), None)
+def timeline(b: Bundle) -> dict:
+    """Return timeline of sub-events and items with timestamps."""
+    steps = []
+    for r in b.timeline:
+        steps.append({
+            "timestamp": r["start"],
+            "text": f'{r["label"]} — {r["count"]} items',
+            "source_type": "subevent",
+            "item_id": r.get("entity_id"),
+        })
+
+    answer = f"Timeline: {len(steps)} sub-event(s) in order." if steps else "No timeline events found."
+    subgraph = [r.get("entity_id") for r in b.timeline if r.get("entity_id")]
+    return {
+        "answer": answer,
+        "answer_parts": [answer],
+        "steps": steps,
+        "citations": [],
+        "subgraph": subgraph,
+    }
 
 
-def _visa_timeline(b: Bundle) -> dict:
-    se = _subevent(b, "Visa")
-    m = {it.id: it for it in b.items}
-    rel = {v.item_id for v in b.graph.relevance if v.relevant}
-    items = [m[i] for i in (se.item_ids if se else set()) if i in m and i in rel]
-    items.sort(key=lambda it: (it.timestamp.replace(tzinfo=timezone.utc)
-                               if it.timestamp and it.timestamp.tzinfo is None
-                               else it.timestamp) or _min())
-    steps = [{"timestamp": it.timestamp.isoformat() if it.timestamp else None,
-              "source_type": it.source_type.value, "channel": it.channel,
-              "text": (it.subject or it.body[:90]).strip()[:110], "item_id": it.id}
-             for it in items[:15]]
-    return {"question": QUERIES[1]["q"],
-            "answer": f"{len(items)} visa-related items across "
-                      f"{len({it.source_type.value for it in items})} channels, in order:",
-            "steps": steps, "citations": _cite(b, [it.id for it in items]),
-            "subgraph": [se.id] if se else []}
-
-
-def _correspondents(b: Bundle) -> dict:
+def who(b: Bundle) -> dict:
+    """Return key people, excluding the owner entity."""
     people = {e.id: e for e in b.graph.entities if e.type.value == "person"}
-    scores = {}
-    for e in b.graph.edges:
-        if e.kind == "corresponded_with":
-            scores[e.source] = scores.get(e.source, 0) + e.weight
-            scores[e.target] = scores.get(e.target, 0) + e.weight
-    ranked = sorted(scores.items(), key=lambda kv: -kv[1])[:10]
-    rows = [{"person": people[pid].label, "emails": people[pid].attrs.get("emails", []),
-             "message_weight": int(w)} for pid, w in ranked if pid in people]
-    return {"question": QUERIES[2]["q"],
-            "answer": f"Top correspondents (across email + WhatsApp), after resolving "
-                      f"duplicate identities:",
-            "table": rows, "citations": [],
-            "subgraph": [pid for pid, _ in ranked]}
+    # Exclude owner
+    people = {pid: e for pid, e in people.items() if not e.attrs.get("owner")}
+
+    # Score by correspondence edges
+    scores: dict[str, float] = {}
+    for edge in b.graph.edges:
+        if edge.kind == "corresponded_with":
+            scores[edge.source] = scores.get(edge.source, 0) + edge.weight
+            scores[edge.target] = scores.get(edge.target, 0) + edge.weight
+
+    # Fall back to mention count
+    for pid, e in people.items():
+        if pid not in scores:
+            scores[pid] = float(len(e.mentions))
+
+    ranked = sorted(
+        [(pid, sc) for pid, sc in scores.items() if pid in people],
+        key=lambda kv: -kv[1]
+    )[:10]
+
+    table = []
+    for pid, sc in ranked:
+        e = people[pid]
+        emails = e.attrs.get("emails", [])
+        channels = list({m.item_id.split(":")[0] for m in e.mentions if ":" in m.item_id})
+        table.append({
+            "name": e.label,
+            "mentions": len(e.mentions),
+            "channels": channels,
+            "emails": emails[:2],
+        })
+
+    answer = f"{len(table)} key people identified (owner excluded)." if table else "No people found."
+    return {
+        "answer": answer,
+        "answer_parts": [answer],
+        "table": table,
+        "citations": [],
+        "subgraph": [pid for pid, _ in ranked],
+    }
 
 
-def _timeline_q(b: Bundle) -> dict:
-    return {"question": QUERIES[3]["q"],
-            "answer": "Reconstructed event timeline (sub-events by earliest evidence):",
-            "steps": [{"timestamp": r["start"], "text": f'{r["label"]} — {r["count"]} items',
-                       "source_type": "subevent", "item_id": None} for r in b.timeline],
-            "citations": [], "subgraph": [r["entity_id"] for r in b.timeline]}
+def entity(eid: str, b: Bundle) -> dict:
+    """Fetch entity by id, return attributes, aliases, mentions, edges."""
+    e = b.graph.entity(eid)
+    if not e:
+        return {"error": f"entity {eid!r} not found", "answer": "", "answer_parts": [], "citations": [], "subgraph": []}
+    edges = [ed for ed in b.graph.edges if ed.source == eid or ed.target == eid]
+    return {
+        "answer": f"Entity: {e.label} ({e.type.value})",
+        "answer_parts": [f"Entity: {e.label} ({e.type.value})"],
+        "entity": e.model_dump(),
+        "connected_edges": [ed.model_dump() for ed in edges[:20]],
+        "citations": _cite(b, list(e.item_ids)[:8]),
+        "subgraph": [eid] + [ed.target if ed.source == eid else ed.source for ed in edges[:10]],
+    }
 
 
-def _sick_control(b: Bundle) -> dict:
-    """Negative control: illness content exists but was scoped OUT of the event —
-    proves relevance handling both keeps it findable AND out of event answers."""
-    m = {it.id: it for it in b.items}
-    rel = {v.item_id: v for v in b.graph.relevance}
-    sick = [it for it in b.items
-            if any(w in it.body.lower() for w in ("fever", "sick", "unwell", "ill "))]
-    excluded = [it for it in sick if not rel[it.id].relevant]
-    return {"question": QUERIES[4]["q"],
-            "answer": f"Found {len(sick)} messages mentioning illness. "
-                      f"{len(excluded)} were scoped OUT of the event graph as noise "
-                      f"(so they never contaminate cost/timeline answers) — but they "
-                      f"remain findable here.",
-            "steps": [{"timestamp": it.timestamp.isoformat() if it.timestamp else None,
-                       "source_type": it.source_type.value,
-                       "text": it.body[:110].strip(),
-                       "item_id": it.id,
-                       "note": rel[it.id].rationale} for it in sick[:10]],
-            "citations": _cite(b, [it.id for it in sick]), "subgraph": []}
-
-
-def _min():
-    from datetime import datetime
-    return datetime.min.replace(tzinfo=timezone.utc)
+def starter_questions(b: Bundle) -> list[dict]:
+    """Generate starter questions from query types + top entities."""
+    questions = list(QUERY_TYPES)
+    # Add entity-specific questions from top 2 most-mentioned people
+    people = sorted(
+        [e for e in b.graph.entities if e.type.value == "person" and not e.attrs.get("owner")],
+        key=lambda e: -len(e.mentions)
+    )
+    for p in people[:2]:
+        questions.append({
+            "id": "who",
+            "q": f"What do we know about {p.label}?",
+            "entity_id": p.id,
+        })
+    return questions
 
 
 _HANDLERS = {
-    "trip_cost": _trip_cost, "visa_timeline": _visa_timeline,
-    "correspondents": _correspondents, "timeline": _timeline_q, "sick_control": _sick_control,
+    "money": money,
+    "timeline": timeline,
+    "who": who,
+    # keep backward compat aliases
+    "trip_cost": money,
+    "correspondents": who,
+    "visa_timeline": timeline,
 }

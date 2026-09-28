@@ -239,8 +239,20 @@ def run_query(query_id: str):
 @app.get("/api/ask")
 def ask(q: str = Query(..., min_length=2)):
     """Free-form natural-language question answered by the smart LLM over the graph."""
+    from .llm.client import llm_available
+    if not llm_available():
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=503,
+            content={"error": "llm_unavailable", "message": "Free-form questions need an API key. The structured queries above still work."}
+        )
     from .query_llm import query_graph
     return query_graph(q, bundle())
+
+
+@app.get("/api/starter_questions")
+def starter_questions_endpoint():
+    return Q.starter_questions(bundle())
 
 
 @app.get("/api/capabilities/models")

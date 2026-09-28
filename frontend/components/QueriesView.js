@@ -26,7 +26,14 @@ export default function QueriesView({ onSelectItem, onHighlight }) {
   const runAsk = async () => {
     if (!ask.trim()) return;
     setAsking(true); setAnswer(null);
-    try { setAnswer(await api.ask(ask)); }
+    try {
+      const resp = await api.ask(ask);
+      if (resp.error === 'llm_unavailable') {
+        setAnswer({ answer: resp.message, citations: [] });
+      } else {
+        setAnswer(resp);
+      }
+    }
     catch (e) { setAnswer({ answer: `Error: ${e}`, citations: [] }); }
     finally { setAsking(false); }
   };
@@ -71,6 +78,9 @@ export default function QueriesView({ onSelectItem, onHighlight }) {
         <div style={{ marginTop: 16 }}>
           <div className="section-h">Answer</div>
           <p><strong>{result.answer}</strong></p>
+          {result.caveats?.map((c, i) => (
+            <div key={i} className="note">{c}</div>
+          ))}
           {result.note && <div className="note">⚖️ {result.note}</div>}
 
           {result.table && (

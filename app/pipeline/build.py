@@ -1,10 +1,11 @@
 """Orchestrate the pipeline into an EventGraph, and derive relations + timeline.
 
-parse (done upstream) → dedup → relevance → extract entities → resolve people →
+parse (done upstream) → dedup → extract entities → resolve people →
 relations → timeline. Heuristic today, interfaces ready for LLM swap-in.
 """
 from __future__ import annotations
 
+import difflib
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -15,7 +16,6 @@ from ..ingest.dedup import DedupResult, find_duplicates
 from ..ingest.participants import mark_shared_mailboxes
 from ..schema import SourceItem
 from . import entities as E
-from .relevance import score_relevance
 
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 _MONEY_RE = re.compile(r"([0-9][0-9,]*\.[0-9]{2})")
@@ -34,30 +34,51 @@ class Bundle:
     timeline: list[dict] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
     review_queue: list[dict] = field(default_factory=list)
+    item_topics: dict = field(default_factory=dict)
+
+
+def _all_relevant(items):
+    """Mark all items as relevant (relevance is now a query-time concern)."""
+    return [RelevanceVerdict(item_id=it.id, relevant=True, score=1.0,
+                              rationale="all items included") for it in items]
+
+
+def _consolidate_topics(all_topics: list[str]) -> dict[str, str]:
+    """Map each raw topic label to its canonical (normalized, deduplicated) form."""
+    norm: dict[str, str] = {}
+    canonical_groups: list[tuple[str, set]] = []
+    for t in sorted(set(all_topics)):
+        tn = re.sub(r'[^a-z0-9 ]', '', t.lower().strip())
+        for i, (canon, variants) in enumerate(canonical_groups):
+            canon_n = re.sub(r'[^a-z0-9 ]', '', canon.lower().strip())
+            ratio = difflib.SequenceMatcher(None, tn, canon_n).ratio()
+            if ratio >= 0.85:
+                variants.add(t)
+                norm[t] = canon
+                break
+        else:
+            canonical_groups.append((t, {t}))
+            norm[t] = t
+    return norm
 
 
 def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None) -> Bundle:
     mark_shared_mailboxes(items)  # downgrade addresses used by 3+ names to system
     dedup = find_duplicates(items)
-    # Stamp each duplicate with its canonical id, then run every downstream stage
-    # over canonicals only. Copies stay in `items` (full provenance) but no longer
-    # inflate counts, money totals, or relevance — a forwarded invoice is a dup, so
-    # its amount is counted once.
     _mark_duplicates(items, dedup)
     canon_items = [it for it in items if not it.duplicate_of]
 
+    item_topics: dict = {}
+
     if mode == "llm":
-        relevance, llm_extractions = _llm_stage(canon_items, progress)
+        relevance, llm_extractions, item_topics = _llm_stage(canon_items, progress)
     else:
-        relevance, llm_extractions = score_relevance(canon_items), None
+        relevance, llm_extractions = _all_relevant(canon_items), None
 
-    relevant_ids = {v.item_id for v in relevance if v.relevant}
-    rel_items = [it for it in canon_items if it.id in relevant_ids] or canon_items
+    # All canonical items go through extraction — relevance is query-time only
+    rel_items = canon_items
+    relevant_ids = {v.item_id for v in relevance if v.relevant}  # for stats
 
-    # Deterministic identity must-links + structural owner inference, before people
-    # resolution. The owner's email identity, WhatsApp leet handle and calendar-self
-    # marker share no identifier, so structural inference (reach across channels) is
-    # what collapses them into one owner entity.
     from ..resolve.identity import build_identity_index
     from ..resolve.owner import infer_owner
     identity = build_identity_index(canon_items)
@@ -74,8 +95,6 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
         all_merges.extend(merges)
         resolve_label = "llm"
     else:
-        # Heuristic fallback: identifier merges (email/phone) + structural relations.
-        # No name-similarity or gazetteer merges — those are LLM territory.
         people, merges = E.resolve_people(
             rel_items, owner_refs=set(owner.refs), owner_label=owner.label,
             identifier_only=True,
@@ -86,7 +105,6 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
         money = E.extract_money(rel_items)
         resolve_label = "heuristic (identifier merges + structural relations)"
 
-    # sub-events + documents are structural in both modes (timeline needs them)
     subevents = E.extract_subevents(rel_items)
     documents = _extract_documents(rel_items)
 
@@ -106,12 +124,10 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
         "review_queue": len(review_queue),
     }
     return Bundle(items=items, dedup=dedup, graph=graph, timeline=timeline, stats=stats,
-                  review_queue=review_queue)
+                  review_queue=review_queue, item_topics=item_topics)
 
 
 def _mark_duplicates(items: list[SourceItem], dedup: DedupResult) -> None:
-    """Stamp `duplicate_of` on every item that is a copy of an earlier one, using the
-    dedup canonical map (exact groups take priority over near-dup clusters)."""
     for it in items:
         canon = dedup.canonical.get(it.id)
         it.duplicate_of = canon if (canon and canon != it.id) else None
@@ -119,7 +135,7 @@ def _mark_duplicates(items: list[SourceItem], dedup: DedupResult) -> None:
 
 # --------------------------------------------------------------------------- LLM stage
 def _llm_stage(items, progress):
-    """Run LLM extraction, return (relevance verdicts, chunk extractions)."""
+    """Run LLM extraction, return (relevance verdicts, chunk extractions, item_topics)."""
     from ..llm.extract import extract_chunks
 
     def _p(done, total):
@@ -127,47 +143,50 @@ def _llm_stage(items, progress):
             progress("llm", f"LLM extraction {done}/{total} batches")
 
     extractions = extract_chunks(items, progress=_p)
-    itemmap = {it.id: it for it in items}
 
-    # Derive relevance from whether any chunk topics were assigned to the item.
-    item_topics: dict[str, list[str]] = {}
+    # Collect all topics across all items
+    item_topics_raw: dict[str, list[str]] = {}
     for ce in extractions:
         for mt in ce.messages:
-            item_topics.setdefault(mt.real_item_id, []).extend(mt.topics)
+            item_topics_raw.setdefault(mt.real_item_id, []).extend(mt.topics)
+
+    # Consolidate near-identical topic labels
+    all_topic_labels = [t for topics in item_topics_raw.values() for t in topics]
+    topic_map = _consolidate_topics(all_topic_labels) if all_topic_labels else {}
+
+    # Apply consolidation
+    item_topics: dict[str, list[str]] = {}
+    for iid, topics in item_topics_raw.items():
+        consolidated = list(dict.fromkeys(topic_map.get(t, t) for t in topics))
+        item_topics[iid] = consolidated
 
     relevance = []
     for it in items:
         topics = item_topics.get(it.id, [])
+        # All items are included; topics stored for query-time scoping
         relevance.append(RelevanceVerdict(
             item_id=it.id,
-            relevant=bool(topics),
-            score=1.0 if topics else 0.0,
-            rationale=", ".join(topics[:3]) if topics else "no topics from LLM",
+            relevant=True,
+            score=1.0 if topics else 0.5,
+            rationale=", ".join(topics[:3]) if topics else "no topics assigned",
+            topics=topics,
         ))
 
-    return relevance, extractions
+    return relevance, extractions, item_topics
 
 
 def _llm_resolve_stage(rel_items, extractions, owner, identity):
-    """Run LLM-based resolution for orgs, locations, and people.
-
-    Returns (people, orgs, locations, money, merges, review_queue).
-    """
     from ..resolve.profiles import build_profiles_from_extractions, build_profiles_from_identity_clusters
     from ..resolve.llm_resolve import resolve_profiles
 
     items_by_id = {it.id: it for it in rel_items}
 
-    # --- People: resolve using identity clusters (Phase 2 identity + LLM)
-    # Build profiles from identity clusters so the LLM sees named profiles.
     id_profiles = build_profiles_from_identity_clusters(identity.clusters, items_by_id)
     person_bundle = resolve_profiles(id_profiles, "person")
 
-    # Also resolve people from LLM extractions.
     ext_profiles = [p for p in build_profiles_from_extractions(extractions, items_by_id)
                     if p.type == "person"]
 
-    # Use Phase-2 people resolution as the base, then apply LLM merges on top.
     people, base_merges = E.resolve_people(
         rel_items, owner_refs=set(owner.refs), owner_label=owner.label,
         identifier_only=True,
@@ -176,7 +195,6 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
     all_merges: list[MergeRecord] = list(base_merges) + list(person_bundle.merges)
     review_queue: list[dict] = list(person_bundle.review_queue)
 
-    # --- Orgs
     org_profiles = [p for p in build_profiles_from_extractions(extractions, items_by_id)
                     if p.type == "org"]
     if org_profiles:
@@ -187,7 +205,6 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
     else:
         orgs = _domain_orgs_heuristic(people, start_index=0)
 
-    # --- Locations
     loc_profiles = [p for p in build_profiles_from_extractions(extractions, items_by_id)
                     if p.type == "location"]
     if loc_profiles:
@@ -199,21 +216,13 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
     else:
         locations = []
 
-    # --- Money (always heuristic)
     money = _money_from_llm(extractions, rel_items)
 
     return people, orgs, locations, money, all_merges, review_queue
 
 
-def _profiles_to_entities(
-    profiles,
-    merged_groups: dict,
-    etype: EntityType,
-    prefix: str,
-) -> list[Entity]:
-    """Convert resolved profile groups into Entity objects."""
+def _profiles_to_entities(profiles, merged_groups: dict, etype: EntityType, prefix: str) -> list[Entity]:
     profiles_by_id = {p.id: p for p in profiles}
-    # Root -> members
     used: set[str] = set()
     ents: list[Entity] = []
     k = 0
@@ -221,7 +230,6 @@ def _profiles_to_entities(
         if root in used:
             continue
         used |= members
-        # Canonical label: surface with highest total count across merged profiles.
         surface_counts: dict[str, int] = defaultdict(int)
         item_ids: set[str] = set()
         for mid in members:
@@ -244,8 +252,6 @@ def _profiles_to_entities(
 
 
 def _domain_orgs_heuristic(people, start_index=0) -> list[Entity]:
-    """Derive institution/company orgs from people's email domains — generic, works
-    on any dataset (heuristic fallback; labelled as such in stats)."""
     by_domain: dict[str, set] = defaultdict(set)
     dom_items: dict[str, set] = defaultdict(set)
     for p in people:
@@ -271,7 +277,6 @@ def _money_from_llm(extractions, items) -> list[Entity]:
     from collections import defaultdict
     from . import currency as C
 
-    # Gather money mentions from chunk extractions.
     amt_items: dict[float, set] = defaultdict(set)
     amt_surfaces: dict[float, list] = defaultdict(list)
 
@@ -299,7 +304,6 @@ def _extract_documents(items: list[SourceItem]) -> list[Entity]:
     docs = []
     for k, it in enumerate(i for i in items if i.source_type.value == "pdf"):
         label = (it.subject or "document").replace(".pdf", "")
-        # nicer label from body cue
         low = it.body.lower()
         for cue, name in (("receipt", "Registration Receipt"), ("invoice", "Invoice"),
                           ("certificate", "Certificate of Attendance"), ("boarding", "Boarding Pass"),
@@ -322,8 +326,6 @@ def _relations(items, people, orgs, locations, money, subevents, documents) -> l
                           attrs=attrs or {}))
         eid[0] += 1
 
-    # person lookup by surface AND by email (email match is robust across
-    # heuristic + LLM modes, where surface strings differ).
     surf2person: dict[str, str] = {}
     email2person: dict[str, str] = {}
     for p in people:
@@ -341,7 +343,6 @@ def _relations(items, people, orgs, locations, money, subevents, documents) -> l
             return email2person[p.id_value]
         return surf2person.get(p.raw)
 
-    # corresponded_with (person <-> person), aggregated
     pair_items: dict[tuple, set] = defaultdict(set)
     for it in items:
         senders = [r for r in (resolve_participant(p) for p in it.senders) if r]
@@ -353,12 +354,10 @@ def _relations(items, people, orgs, locations, money, subevents, documents) -> l
     for (a, b), iids in pair_items.items():
         add(a, b, "corresponded_with", iids, weight=float(len(iids)))
 
-    # affiliated_with (person -> domain-derived org). Generic — any email domain.
     for o in orgs:
         for pid in o.attrs.get("member_person_ids", []):
             add(pid, o.id, "affiliated_with", list(o.item_ids)[:5])
 
-    # money -> org (paid_to): link each amount to the org it most co-occurs with
     for mnt in money:
         best, best_ov = None, 0
         for o in orgs:
@@ -368,14 +367,12 @@ def _relations(items, people, orgs, locations, money, subevents, documents) -> l
         if best:
             add(mnt.id, best.id, "paid_to", list(mnt.item_ids & best.item_ids))
 
-    # org/subevent -> location (held_at) by co-occurrence
     for loc in locations:
         for o in orgs:
             ov = o.item_ids & loc.item_ids
             if len(ov) >= 2:
                 add(o.id, loc.id, "held_at", list(ov), weight=float(len(ov)))
 
-    # document -> subevent (document_for) by shared items
     for d in documents:
         best, best_ov = None, 0
         for se in subevents:
@@ -389,9 +386,7 @@ def _relations(items, people, orgs, locations, money, subevents, documents) -> l
 
 
 def _as_utc(dt):
-    """Comparable key: treat naive (WhatsApp) as UTC, convert aware (email) to UTC."""
     from datetime import timezone
-
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
