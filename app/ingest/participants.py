@@ -16,6 +16,9 @@ from ..schema import Participant, ParticipantRole, SourceType
 # --- normalization ---------------------------------------------------------
 _INVISIBLE_RE = re.compile(r"[‎‏‪-‮⁦-⁩ ]")
 _WS_RE = re.compile(r"\s+")
+# A real email needs a dotted domain; this keeps leet handles like "A!@n" from
+# being read as addresses (which would forge a huge bogus identity cluster).
+_EMAIL_RE = re.compile(r"[^@\s<>,]+@[^@\s<>,]+\.[^@\s<>,]+")
 
 
 def strip_invisible(s: str) -> str:
@@ -173,6 +176,9 @@ def _classify_address(display: str, email: str, role: ParticipantRole) -> Partic
     """Classify a parsed (display, email) pair from an address header."""
     email = email.strip().lower()
     display = strip_invisible(display)
+    if not _EMAIL_RE.fullmatch(email):
+        # not a real address (e.g. a leet handle "A!@n") — treat as a label
+        return _classify_label(display or email, role, None)
     if _role_localpart(email):
         return Participant(display_name=display or None, id_type="email", id_value=email,
                            raw=(f"{display} <{email}>" if display else email),
@@ -208,7 +214,7 @@ def _parse_field(field: str, role: ParticipantRole, group_title: str | None) -> 
     # strips them internally. This preserves provenance while matching on clean text.
     if not strip_invisible(field):
         return []
-    if "@" in field:
+    if _EMAIL_RE.search(field):
         # Address list: getaddresses respects quotes and angle brackets.
         out = []
         for display, email in getaddresses([field]):
