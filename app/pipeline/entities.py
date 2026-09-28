@@ -1,9 +1,12 @@
 """Entity extraction + resolution (heuristic stand-in for the LLM stages).
 
-Extraction pulls typed mentions (people from headers; orgs from email domains +
-gazetteer; locations/money/documents/subevents from the text). Resolution
-canonicalizes them — the hard part — with a visible merge log. Both are behind
-plain functions an LLM version can replace.
+Extraction pulls typed mentions (people from headers; money/documents/subevents
+from the text). Resolution canonicalizes them — the hard part — with a visible
+merge log. Both are behind plain functions an LLM version can replace.
+
+Corpus-specific gazetteers (DOMAIN_ORG, LOCATIONS, SUBEVENTS) have been
+removed. The heuristic path uses only structural signals: identifier merges
+(email/phone) for people, domain-derived orgs, keyword-based subevents.
 """
 from __future__ import annotations
 
@@ -13,16 +16,11 @@ from collections import defaultdict
 from ..graph_model import Entity, EntityType, MergeRecord, Mention
 from ..schema import SourceItem, normalize_text
 
-# ----------------------------------------------------------------------------- gazetteers
-DOMAIN_ORG = {
-    "ispa.org": "ISPA", "ispasignalsociety.org": "ISPA", "ispaicvsp.wpengine.com": "ISPA",
-    "confdesk.io": "ConfDesk", "itaravali.ac.in": "Institute of Technology Aravali",
-    "students.itaravali.ac.in": "Institute of Technology Aravali",
-    "kuni.eu": "Kuni University", "eitbihar.ac.in": "EIT Bihar",
-    "ipalvor.pt": "IPAlvor", "hmcoe.onmicrosoft.com": "HM College O365",
-}
-LOCATIONS = ["Kaldera", "Norvania", "Mumbai", "India"]
-SUBEVENTS = {
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-@]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+_MONEY_RE = re.compile(r"\$\s?([0-9][0-9,]*\.[0-9]{2})")
+
+# Generic subevent keywords — no corpus-specific names or places.
+_SUBEVENT_KEYWORDS: dict[str, list[str]] = {
     "Acceptance": ["accept", "acceptance", "camera-ready", "camera ready"],
     "Rebuttal": ["rebuttal"],
     "Registration & Payment": ["registration", "register", "invoice", "receipt", "payment"],
@@ -31,9 +29,6 @@ SUBEVENTS = {
     "Accommodation": ["airbnb", "accommodation", "hotel", "check-in"],
     "Presentation": ["presentation", "poster", "badge", "session", "workshop"],
 }
-
-_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-@]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-_MONEY_RE = re.compile(r"\$\s?([0-9][0-9,]*\.[0-9]{2})")
 
 
 # ----------------------------------------------------------------------------- extraction
@@ -65,13 +60,6 @@ def _people_mentions(items: list[SourceItem], owner_refs: set | None = None):
     return out, owner_idx
 
 
-def _leet_norm(name: str) -> str:
-    s = name.lower().translate(str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "@": "a", "$": "s"}))
-    s = re.sub(r"[^a-z ]", "", s)
-    toks = sorted(t for t in s.split() if t)
-    return " ".join(toks)
-
-
 def _email_stem(email: str) -> str:
     local = email.split("@")[0]
     return re.sub(r"[^a-z]", "", local.lower())  # drop digits/dots: rohan0707.menezes -> rohanmenezes
@@ -98,50 +86,52 @@ def resolve_people(
     items: list[SourceItem],
     owner_refs: set | None = None,
     owner_label: str | None = None,
+    identifier_only: bool = False,
 ) -> tuple[list[Entity], list[MergeRecord]]:
     raw, owner_idx = _people_mentions(items, owner_refs)
-    return resolve_person_mentions(raw, owner_idx=owner_idx, owner_label=owner_label)
+    return _resolve_person_mentions(raw, owner_idx=owner_idx, owner_label=owner_label,
+                                    identifier_only=identifier_only)
 
 
-def resolve_person_mentions(
+def _resolve_person_mentions(
     raw,
     owner_idx: set[int] | None = None,
     owner_label: str | None = None,
+    identifier_only: bool = False,
 ) -> tuple[list[Entity], list[MergeRecord]]:
-    """Core entity resolution over (name, email, item_id, surface) tuples — shared
-    by the header-based (heuristic) and LLM extraction paths.
+    """Core entity resolution over (name, email, item_id, surface) tuples.
+
+    `identifier_only=True` (heuristic fallback): merge only on shared email/phone.
+    `identifier_only=False` (legacy): also merge on email-stem (default is now True
+    for the heuristic path to avoid false positives).
 
     `owner_idx` names the mentions that structural owner inference tied to the
     archive owner; they are force-unioned into one entity (flagged `owner`) so the
     owner's email, leet handle and calendar-self surfaces collapse even though they
-    share no identifier."""
+    share no identifier.
+    """
     owner_idx = owner_idx or set()
-    # index each mention by a stable key
     keys = list(range(len(raw)))
     uf = _UF(keys)
 
     by_email: dict[str, list[int]] = defaultdict(list)
     by_stem: dict[str, list[int]] = defaultdict(list)
-    by_name: dict[str, list[int]] = defaultdict(list)
     for i, (name, email, _iid, _surf) in enumerate(raw):
         if email:
             by_email[email].append(i)
-            stem = _email_stem(email)
-            if len(stem) >= 6:  # avoid merging on tiny stems
-                by_stem[stem].append(i)
-        nn = _leet_norm(name)
-        if len(nn) >= 3:
-            by_name[nn].append(i)
+            if not identifier_only:
+                stem = _email_stem(email)
+                if len(stem) >= 6:
+                    by_stem[stem].append(i)
 
     for group in by_email.values():
         for j in group[1:]:
             uf.union(group[0], j)
-    for group in by_stem.values():
-        for j in group[1:]:
-            uf.union(group[0], j)
-    for group in by_name.values():
-        for j in group[1:]:
-            uf.union(group[0], j)
+    if not identifier_only:
+        for group in by_stem.values():
+            for j in group[1:]:
+                uf.union(group[0], j)
+
     # collapse every owner surface into one identity, across channels
     owner_members = sorted(owner_idx)
     for j in owner_members[1:]:
@@ -177,9 +167,6 @@ def resolve_person_mentions(
                     why.append(f"{len(emails)} emails share a name stem")
                 else:
                     why.append(f"{len(emails)} emails co-occur with the same name")
-            norm_names = {_leet_norm(n) for n in names if n}
-            if len(names) > 1 and len(norm_names) == 1 and any(n != names[0] for n in names):
-                why.append("name variants match after leet/normalization")
             if is_owner:
                 why.append("owner surfaces across channels collapsed by structural inference")
             merges.append(MergeRecord(
@@ -192,40 +179,8 @@ def resolve_person_mentions(
 def _best_label(names, emails):
     real = [n for n in names if n and "@" not in n and len(n) > 1]
     if real:
-        # prefer the longest, most complete-looking name
         return max(real, key=lambda n: (len(n.split()), len(n)))
     return emails[0] if emails else "unknown"
-
-
-def extract_orgs(items: list[SourceItem], people: list[Entity]) -> list[Entity]:
-    org_items: dict[str, set[str]] = defaultdict(set)
-    for it in items:
-        emails = list(it.emails()) + _EMAIL_RE.findall(it.body)
-        for email in emails:
-            domain = email.split("@")[-1].lower()
-            for dom, org in DOMAIN_ORG.items():
-                if domain.endswith(dom):
-                    org_items[org].add(it.id)
-    ents = []
-    for k, (org, iids) in enumerate(sorted(org_items.items())):
-        ents.append(Entity(id=f"org:{k}", type=EntityType.ORG, label=org,
-                           mentions=[Mention(item_id=i, text=org) for i in sorted(iids)]))
-    return ents
-
-
-def extract_gazetteer(items: list[SourceItem], terms: list[str], etype: EntityType, prefix: str) -> list[Entity]:
-    found: dict[str, set[str]] = defaultdict(set)
-    pats = {t: re.compile(rf"\b{re.escape(t.lower())}\b") for t in terms}
-    for it in items:
-        text = normalize_text(f"{it.subject or ''} {it.body}")
-        for t, pat in pats.items():
-            if pat.search(text):
-                found[t].add(it.id)
-    ents = []
-    for k, (t, iids) in enumerate(sorted(found.items())):
-        ents.append(Entity(id=f"{prefix}:{k}", type=etype, label=t,
-                           mentions=[Mention(item_id=i, text=t) for i in sorted(iids)]))
-    return ents
 
 
 def extract_money(items: list[SourceItem]) -> list[Entity]:
@@ -249,7 +204,7 @@ def extract_money(items: list[SourceItem]) -> list[Entity]:
 
 def extract_subevents(items: list[SourceItem]) -> list[Entity]:
     ents = []
-    for k, (name, kws) in enumerate(SUBEVENTS.items()):
+    for k, (name, kws) in enumerate(_SUBEVENT_KEYWORDS.items()):
         pats = [re.compile(rf"\b{re.escape(w)}\b") for w in kws]
         iids = set()
         for it in items:

@@ -10,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ..graph_model import Edge, Entity, EntityType, EventGraph, Mention, RelevanceVerdict
+from ..graph_model import Edge, Entity, EntityType, EventGraph, Mention, MergeRecord, RelevanceVerdict
 from ..ingest.dedup import DedupResult, find_duplicates
 from ..ingest.participants import mark_shared_mailboxes
 from ..schema import SourceItem
@@ -20,6 +20,11 @@ from .relevance import score_relevance
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 _MONEY_RE = re.compile(r"([0-9][0-9,]*\.[0-9]{2})")
 
+_PERSONAL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.in", "hotmail.com",
+    "outlook.com", "live.com", "icloud.com", "proton.me", "protonmail.com", "aol.com",
+}
+
 
 @dataclass
 class Bundle:
@@ -28,6 +33,7 @@ class Bundle:
     graph: EventGraph
     timeline: list[dict] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
+    review_queue: list[dict] = field(default_factory=list)
 
 
 def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None) -> Bundle:
@@ -41,9 +47,9 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
     canon_items = [it for it in items if not it.duplicate_of]
 
     if mode == "llm":
-        relevance, llm_ents = _llm_stage(canon_items, progress)
+        relevance, llm_extractions = _llm_stage(canon_items, progress)
     else:
-        relevance, llm_ents = score_relevance(canon_items), None
+        relevance, llm_extractions = score_relevance(canon_items), None
 
     relevant_ids = {v.item_id for v in relevance if v.relevant}
     rel_items = [it for it in canon_items if it.id in relevant_ids] or canon_items
@@ -57,41 +63,50 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
     identity = build_identity_index(canon_items)
     owner = infer_owner(canon_items, identity)
 
-    # People + their correspondence come from message HEADERS in both modes — this
-    # is deterministic and data-independent, so the social graph always connects.
-    # The LLM (when on) contributes the harder, content-derived entity types.
-    people, merges = E.resolve_people(
-        rel_items, owner_refs=set(owner.refs), owner_label=owner.label
-    )
-    if llm_ents is not None:
-        orgs = _group_llm(llm_ents["org"], EntityType.ORG, "org")
-        locations = _group_llm(llm_ents["location"], EntityType.LOCATION, "loc")
-        money = _money_from_llm(llm_ents["money"], rel_items)
+    review_queue: list[dict] = []
+    all_merges: list[MergeRecord] = []
+
+    if mode == "llm" and llm_extractions is not None:
+        people, orgs, locations, money, merges, rq = _llm_resolve_stage(
+            rel_items, llm_extractions, owner, identity,
+        )
+        review_queue.extend(rq)
+        all_merges.extend(merges)
+        resolve_label = "llm"
     else:
-        orgs = E.extract_orgs(rel_items, people)
-        locations = E.extract_gazetteer(rel_items, E.LOCATIONS, EntityType.LOCATION, "loc")
+        # Heuristic fallback: identifier merges (email/phone) + structural relations.
+        # No name-similarity or gazetteer merges — those are LLM territory.
+        people, merges = E.resolve_people(
+            rel_items, owner_refs=set(owner.refs), owner_label=owner.label,
+            identifier_only=True,
+        )
+        all_merges.extend(merges)
+        orgs = _domain_orgs_heuristic(people, start_index=0)
+        locations = []
         money = E.extract_money(rel_items)
-    # Institution/company orgs derived generically from email domains (any dataset).
-    domain_orgs = _domain_orgs(people, len(orgs))
-    orgs = orgs + domain_orgs
-    # sub-events + documents stay heuristic in both modes (timeline needs them)
+        resolve_label = "heuristic (identifier merges + structural relations)"
+
+    # sub-events + documents are structural in both modes (timeline needs them)
     subevents = E.extract_subevents(rel_items)
     documents = _extract_documents(rel_items)
 
     all_entities = people + orgs + locations + money + subevents + documents
     edges = _relations(rel_items, people, orgs, locations, money, subevents, documents)
 
-    graph = EventGraph(entities=all_entities, edges=edges, merges=merges, relevance=relevance)
+    graph = EventGraph(entities=all_entities, edges=edges, merges=all_merges, relevance=relevance)
     timeline = _timeline(subevents, items)
     stats = {
         "items": len(items), "canonical_items": len(canon_items),
         "relevant_items": len(relevant_ids),
         "exact_dupes": dedup.n_exact_dupes, "near_dupes": dedup.n_near_dupes,
         "entities": len(all_entities), "edges": len(edges),
-        "people": len(people), "merges": len(merges), "mode": mode,
+        "people": len(people), "merges": len(all_merges), "mode": mode,
         "owner": owner.label, "owner_confident": owner.confident,
+        "resolve_label": resolve_label,
+        "review_queue": len(review_queue),
     }
-    return Bundle(items=items, dedup=dedup, graph=graph, timeline=timeline, stats=stats)
+    return Bundle(items=items, dedup=dedup, graph=graph, timeline=timeline, stats=stats,
+                  review_queue=review_queue)
 
 
 def _mark_duplicates(items: list[SourceItem], dedup: DedupResult) -> None:
@@ -104,65 +119,133 @@ def _mark_duplicates(items: list[SourceItem], dedup: DedupResult) -> None:
 
 # --------------------------------------------------------------------------- LLM stage
 def _llm_stage(items, progress):
-    """Run LLM extraction, return (relevance verdicts, grouped LLM entity mentions)."""
-    from ..llm.extract import extract_items
+    """Run LLM extraction, return (relevance verdicts, chunk extractions)."""
+    from ..llm.extract import extract_chunks
 
     def _p(done, total):
         if progress:
             progress("llm", f"LLM extraction {done}/{total} batches")
 
-    extractions = extract_items(items, progress=_p)
+    extractions = extract_chunks(items, progress=_p)
     itemmap = {it.id: it for it in items}
-    relevance = [RelevanceVerdict(item_id=x.item_id, relevant=x.relevant,
-                                  score=1.0 if x.relevant else 0.0,
-                                  rationale=x.rationale or "LLM verdict") for x in extractions]
-    people, org, location, money = [], [], [], []
-    for x in extractions:
-        if not x.relevant:
+
+    # Derive relevance from whether any chunk topics were assigned to the item.
+    item_topics: dict[str, list[str]] = {}
+    for ce in extractions:
+        for mt in ce.messages:
+            item_topics.setdefault(mt.real_item_id, []).extend(mt.topics)
+
+    relevance = []
+    for it in items:
+        topics = item_topics.get(it.id, [])
+        relevance.append(RelevanceVerdict(
+            item_id=it.id,
+            relevant=bool(topics),
+            score=1.0 if topics else 0.0,
+            rationale=", ".join(topics[:3]) if topics else "no topics from LLM",
+        ))
+
+    return relevance, extractions
+
+
+def _llm_resolve_stage(rel_items, extractions, owner, identity):
+    """Run LLM-based resolution for orgs, locations, and people.
+
+    Returns (people, orgs, locations, money, merges, review_queue).
+    """
+    from ..resolve.profiles import build_profiles_from_extractions, build_profiles_from_identity_clusters
+    from ..resolve.llm_resolve import resolve_profiles
+
+    items_by_id = {it.id: it for it in rel_items}
+
+    # --- People: resolve using identity clusters (Phase 2 identity + LLM)
+    # Build profiles from identity clusters so the LLM sees named profiles.
+    id_profiles = build_profiles_from_identity_clusters(identity.clusters, items_by_id)
+    person_bundle = resolve_profiles(id_profiles, "person")
+
+    # Also resolve people from LLM extractions.
+    ext_profiles = [p for p in build_profiles_from_extractions(extractions, items_by_id)
+                    if p.type == "person"]
+
+    # Use Phase-2 people resolution as the base, then apply LLM merges on top.
+    people, base_merges = E.resolve_people(
+        rel_items, owner_refs=set(owner.refs), owner_label=owner.label,
+        identifier_only=True,
+    )
+
+    all_merges: list[MergeRecord] = list(base_merges) + list(person_bundle.merges)
+    review_queue: list[dict] = list(person_bundle.review_queue)
+
+    # --- Orgs
+    org_profiles = [p for p in build_profiles_from_extractions(extractions, items_by_id)
+                    if p.type == "org"]
+    if org_profiles:
+        org_bundle = resolve_profiles(org_profiles, "org")
+        all_merges.extend(org_bundle.merges)
+        review_queue.extend(org_bundle.review_queue)
+        orgs = _profiles_to_entities(org_profiles, org_bundle.merged_groups, EntityType.ORG, "org")
+    else:
+        orgs = _domain_orgs_heuristic(people, start_index=0)
+
+    # --- Locations
+    loc_profiles = [p for p in build_profiles_from_extractions(extractions, items_by_id)
+                    if p.type == "location"]
+    if loc_profiles:
+        loc_bundle = resolve_profiles(loc_profiles, "location")
+        all_merges.extend(loc_bundle.merges)
+        review_queue.extend(loc_bundle.review_queue)
+        locations = _profiles_to_entities(loc_profiles, loc_bundle.merged_groups,
+                                          EntityType.LOCATION, "loc")
+    else:
+        locations = []
+
+    # --- Money (always heuristic)
+    money = _money_from_llm(extractions, rel_items)
+
+    return people, orgs, locations, money, all_merges, review_queue
+
+
+def _profiles_to_entities(
+    profiles,
+    merged_groups: dict,
+    etype: EntityType,
+    prefix: str,
+) -> list[Entity]:
+    """Convert resolved profile groups into Entity objects."""
+    profiles_by_id = {p.id: p for p in profiles}
+    # Root -> members
+    used: set[str] = set()
+    ents: list[Entity] = []
+    k = 0
+    for root, members in merged_groups.items():
+        if root in used:
             continue
-        for e in x.entities:
-            t, name, surface = e.get("type"), e.get("name", ""), e.get("surface", e.get("name", ""))
-            if t == "person":
-                email = surface if "@" in surface else (name if "@" in name else "")
-                people.append((name, email.lower(), x.item_id, surface))
-            elif t == "org":
-                org.append((name, x.item_id, surface))
-            elif t == "location":
-                location.append((name, x.item_id, surface))
-            elif t == "money":
-                money.append((name, x.item_id, surface))
-    return relevance, {"people": people, "org": org, "location": location, "money": money}
-
-
-def _group_llm(rows, etype: EntityType, prefix: str) -> list[Entity]:
-    """Group (name, item_id, surface) mentions into canonical entities by name."""
-    from collections import defaultdict
-
-    groups: dict[str, list[tuple]] = defaultdict(list)
-    for name, iid, surface in rows:
-        key = re.sub(r"\s+", " ", name.strip().lower())
-        if key:
-            groups[key].append((name, iid, surface))
-    ents = []
-    for k, (key, members) in enumerate(sorted(groups.items())):
-        label = max((m[0] for m in members), key=len)
-        ents.append(Entity(id=f"{prefix}:{k}", type=etype, label=label,
-                           aliases=sorted({m[2] for m in members}),
-                           mentions=[Mention(item_id=m[1], text=m[2]) for m in members]))
+        used |= members
+        # Canonical label: surface with highest total count across merged profiles.
+        surface_counts: dict[str, int] = defaultdict(int)
+        item_ids: set[str] = set()
+        for mid in members:
+            p = profiles_by_id.get(mid)
+            if p:
+                for surf, cnt in p.surfaces.items():
+                    surface_counts[surf] += cnt
+                item_ids |= p.item_ids
+        if not surface_counts:
+            continue
+        label = max(surface_counts, key=lambda s: (surface_counts[s], len(s)))
+        aliases = sorted(surface_counts)
+        ents.append(Entity(
+            id=f"{prefix}:{k}", type=etype, label=label,
+            aliases=aliases,
+            mentions=[Mention(item_id=i, text=label) for i in sorted(item_ids)],
+        ))
+        k += 1
     return ents
 
 
-_PERSONAL_DOMAINS = {
-    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.in", "hotmail.com",
-    "outlook.com", "live.com", "icloud.com", "proton.me", "protonmail.com", "aol.com",
-}
-
-
-def _domain_orgs(people, start_index=0) -> list[Entity]:
+def _domain_orgs_heuristic(people, start_index=0) -> list[Entity]:
     """Derive institution/company orgs from people's email domains — generic, works
-    on any dataset (replaces the corpus-specific gazetteer for affiliation)."""
-    from collections import defaultdict
-
+    on any dataset (heuristic fallback; labelled as such in stats)."""
     by_domain: dict[str, set] = defaultdict(set)
     dom_items: dict[str, set] = defaultdict(set)
     for p in people:
@@ -184,18 +267,24 @@ def _domain_orgs(people, start_index=0) -> list[Entity]:
     return ents
 
 
-def _money_from_llm(rows, items) -> list[Entity]:
+def _money_from_llm(extractions, items) -> list[Entity]:
     from collections import defaultdict
     from . import currency as C
 
+    # Gather money mentions from chunk extractions.
     amt_items: dict[float, set] = defaultdict(set)
     amt_surfaces: dict[float, list] = defaultdict(list)
-    for name, iid, surface in rows:
-        m = _MONEY_RE.search(f"{name} {surface}")
-        if m:
-            amt = float(m.group(1).replace(",", ""))
-            amt_items[amt].add(iid)
-            amt_surfaces[amt].append(surface)
+
+    for ce in extractions:
+        for mn in ce.mentions:
+            if mn.type != "money":
+                continue
+            m = _MONEY_RE.search(mn.surface)
+            if m:
+                amt = float(m.group(1).replace(",", ""))
+                amt_items[amt].add(mn.real_item_id)
+                amt_surfaces[amt].append(mn.surface)
+
     by_id = {it.id: it for it in items}
     ents = []
     for k, (amt, iids) in enumerate(sorted(amt_items.items(), key=lambda x: -x[0])):
