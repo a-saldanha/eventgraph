@@ -56,6 +56,28 @@ def _norm_type(t: str) -> str:
     return mapping.get(t.lower(), "unknown")
 
 
+def build_conv_local_to_profile_map(
+    extractions: list[ChunkExtraction],
+) -> dict[tuple[str, str], str]:
+    """Return a map from (conversation_id, local_entity) -> profile_id.
+
+    The profile_id assignment matches what build_profiles_from_extractions
+    produces (same sorted enumeration order), so the two can be used together.
+    """
+    groups_seen: dict[tuple[str, str], str] = {}  # key -> type
+    for ce in extractions:
+        for mn in ce.mentions:
+            key = (ce.conversation_id, mn.local_entity)
+            if key not in groups_seen:
+                groups_seen[key] = mn.type
+
+    result: dict[tuple[str, str], str] = {}
+    for k, key in enumerate(sorted(groups_seen.keys())):
+        ptype = _norm_type(groups_seen[key])
+        result[key] = f"{ptype}:{k}"
+    return result
+
+
 def build_profiles_from_extractions(
     extractions: list[ChunkExtraction],
     items_by_id: dict | None = None,

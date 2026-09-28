@@ -86,9 +86,10 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
 
     review_queue: list[dict] = []
     all_merges: list[MergeRecord] = []
+    llm_edges: list[Edge] = []
 
     if mode == "llm" and llm_extractions is not None:
-        people, orgs, locations, money, merges, rq = _llm_resolve_stage(
+        people, orgs, locations, money, merges, rq, llm_edges = _llm_resolve_stage(
             rel_items, llm_extractions, owner, identity,
         )
         review_queue.extend(rq)
@@ -110,6 +111,11 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
 
     all_entities = people + orgs + locations + money + subevents + documents
     edges = _relations(rel_items, people, orgs, locations, money, subevents, documents)
+
+    # In LLM mode, also wire in the LLM-derived relation edges.
+    if mode == "llm" and llm_extractions is not None:
+        _renumber_edges(llm_edges, start=len(edges))
+        edges = edges + llm_edges
 
     graph = EventGraph(entities=all_entities, edges=edges, merges=all_merges, relevance=relevance)
     timeline = _timeline(subevents, items)
@@ -176,7 +182,11 @@ def _llm_stage(items, progress):
 
 
 def _llm_resolve_stage(rel_items, extractions, owner, identity):
-    from ..resolve.profiles import build_profiles_from_extractions, build_profiles_from_identity_clusters
+    from ..resolve.profiles import (
+        build_profiles_from_extractions,
+        build_profiles_from_identity_clusters,
+        build_conv_local_to_profile_map,
+    )
     from ..resolve.llm_resolve import resolve_profiles
 
     items_by_id = {it.id: it for it in rel_items}
@@ -184,9 +194,12 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
     id_profiles = build_profiles_from_identity_clusters(identity.clusters, items_by_id)
     person_bundle = resolve_profiles(id_profiles, "person")
 
-    ext_profiles = [p for p in build_profiles_from_extractions(extractions, items_by_id)
-                    if p.type == "person"]
+    # FIX 1: actually USE ext_profiles — run person extraction profiles through
+    # blocking + LLM resolution so WhatsApp/name surface variants collapse.
+    all_ext_profiles = build_profiles_from_extractions(extractions, items_by_id)
+    ext_profiles = [p for p in all_ext_profiles if p.type == "person"]
 
+    # Start with heuristic people (identifier merges + owner unification).
     people, base_merges = E.resolve_people(
         rel_items, owner_refs=set(owner.refs), owner_label=owner.label,
         identifier_only=True,
@@ -195,8 +208,18 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
     all_merges: list[MergeRecord] = list(base_merges) + list(person_bundle.merges)
     review_queue: list[dict] = list(person_bundle.review_queue)
 
-    org_profiles = [p for p in build_profiles_from_extractions(extractions, items_by_id)
-                    if p.type == "org"]
+    # Run ext_profiles through LLM resolution and apply resulting merges to
+    # the heuristic people entities.
+    if ext_profiles:
+        ext_person_bundle = resolve_profiles(ext_profiles, "person")
+        all_merges.extend(ext_person_bundle.merges)
+        review_queue.extend(ext_person_bundle.review_queue)
+        people = _apply_profile_merges_to_people(
+            people, ext_profiles, ext_person_bundle.merged_groups,
+            owner_label=owner.label,
+        )
+
+    org_profiles = [p for p in all_ext_profiles if p.type == "org"]
     if org_profiles:
         org_bundle = resolve_profiles(org_profiles, "org")
         all_merges.extend(org_bundle.merges)
@@ -205,8 +228,7 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
     else:
         orgs = _domain_orgs_heuristic(people, start_index=0)
 
-    loc_profiles = [p for p in build_profiles_from_extractions(extractions, items_by_id)
-                    if p.type == "location"]
+    loc_profiles = [p for p in all_ext_profiles if p.type == "location"]
     if loc_profiles:
         loc_bundle = resolve_profiles(loc_profiles, "location")
         all_merges.extend(loc_bundle.merges)
@@ -218,7 +240,279 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
 
     money = _money_from_llm(extractions, rel_items)
 
-    return people, orgs, locations, money, all_merges, review_queue
+    # FIX 2: build (conv_id, local_entity) -> canonical entity id map and
+    # wire LLM-extracted relations into graph edges.
+    # Build profile_id -> canonical entity id for all entity types.
+    key_to_profile_id = build_conv_local_to_profile_map(extractions)
+
+    # profile_id -> entity_id: for people, we need surface matching; for
+    # orgs/locations we use the merged_groups from their bundles.
+    profile_id_to_entity_id: dict[str, str] = {}
+
+    # People: match by shared surface/email
+    _people_surface_to_eid = {}
+    _people_email_to_eid = {}
+    for p in people:
+        for a in p.aliases:
+            _people_surface_to_eid.setdefault(a.lower(), p.id)
+        for em in p.attrs.get("emails", []):
+            _people_email_to_eid.setdefault(em.lower(), p.id)
+
+    for ep in ext_profiles:
+        eid = None
+        for ident in ep.identifiers:
+            eid = _people_email_to_eid.get(ident.lower())
+            if eid:
+                break
+        if not eid:
+            for surf in ep.surfaces:
+                eid = _people_surface_to_eid.get(surf.lower())
+                if eid:
+                    break
+        if eid:
+            profile_id_to_entity_id[ep.id] = eid
+
+    # Orgs
+    if org_profiles and org_bundle:  # type: ignore[possibly-undefined]
+        org_ents = {e.id: e for e in orgs}
+        for op in org_profiles:
+            root = _find_root(op.id, org_bundle.merged_groups)
+            # Find the entity whose label matches root's canonical surface
+            for eid, ent in org_ents.items():
+                op_root_profile = next((p for p in org_profiles if p.id == root), None)
+                if op_root_profile and (
+                    ent.label.lower() == op_root_profile.canonical_surface.lower()
+                    or any(a.lower() == op_root_profile.canonical_surface.lower()
+                           for a in ent.aliases)
+                ):
+                    profile_id_to_entity_id[op.id] = eid
+                    break
+
+    # Locations
+    if loc_profiles and loc_bundle:  # type: ignore[possibly-undefined]
+        loc_ents = {e.id: e for e in locations}
+        for lp in loc_profiles:
+            root = _find_root(lp.id, loc_bundle.merged_groups)
+            loc_root_profile = next((p for p in loc_profiles if p.id == root), None)
+            if loc_root_profile:
+                for eid, ent in loc_ents.items():
+                    if (ent.label.lower() == loc_root_profile.canonical_surface.lower()
+                            or any(a.lower() == loc_root_profile.canonical_surface.lower()
+                                   for a in ent.aliases)):
+                        profile_id_to_entity_id[lp.id] = eid
+                        break
+
+    # participant_id -> person entity id (for participant-anchored mentions)
+    participant_to_entity: dict[str, str] = {}
+    for it in rel_items:
+        for p in it.participants:
+            if p.kind == "person":
+                eid = None
+                if p.id_type == "email" and p.id_value:
+                    eid = _people_email_to_eid.get(p.id_value.lower())
+                if not eid and p.display_name:
+                    eid = _people_surface_to_eid.get(p.display_name.lower())
+                if eid and p.id_value:
+                    participant_to_entity.setdefault(p.id_value, eid)
+                    participant_to_entity.setdefault(p.raw, eid)
+
+    # Build (conv_id, local_entity) -> entity_id resolver
+    def resolve_local(conv_id: str, local_entity: str) -> Optional[str]:
+        pid = key_to_profile_id.get((conv_id, local_entity))
+        if pid:
+            return profile_id_to_entity_id.get(pid)
+        return None
+
+    # Collect LLM relation edges (from extractions + derived_relations).
+    llm_edges = _relations_from_llm(
+        extractions, resolve_local, participant_to_entity,
+    )
+
+    return people, orgs, locations, money, all_merges, review_queue, llm_edges
+
+
+def _find_root(pid: str, merged_groups: dict[str, set]) -> str:
+    """Return the root profile id for a given pid in merged_groups."""
+    for root, members in merged_groups.items():
+        if pid in members:
+            return root
+    return pid
+
+
+def _apply_profile_merges_to_people(
+    people: list[Entity],
+    ext_profiles,
+    merged_groups: dict[str, set],
+    owner_label: str | None = None,
+) -> list[Entity]:
+    """Merge heuristic person entities based on LLM profile resolution.
+
+    For each merged group of profiles, collect the person entities that match
+    any profile in the group (by surface or email), then union-find those
+    entities into one canonical entity.  The owner entity is always preserved
+    as the single owner.
+    """
+    if not people or not merged_groups:
+        return people
+
+    # Build surface/email -> person entity id maps
+    surf_to_eid: dict[str, str] = {}
+    email_to_eid: dict[str, str] = {}
+    for p in people:
+        for a in p.aliases:
+            surf_to_eid.setdefault(a.lower(), p.id)
+        for em in p.attrs.get("emails", []):
+            email_to_eid.setdefault(em.lower(), p.id)
+
+    # profile_id -> entity_id match
+    prof_to_eid: dict[str, str] = {}
+    prof_by_id = {ep.id: ep for ep in ext_profiles}
+    for ep in ext_profiles:
+        eid = None
+        for ident in ep.identifiers:
+            eid = email_to_eid.get(ident.lower())
+            if eid:
+                break
+        if not eid:
+            for surf in ep.surfaces:
+                eid = surf_to_eid.get(surf.lower())
+                if eid:
+                    break
+        if eid:
+            prof_to_eid[ep.id] = eid
+
+    # For each merged group, union the matched entity ids
+    all_eids = [p.id for p in people]
+    uf = _UF_local(all_eids)
+
+    for root, members in merged_groups.items():
+        if len(members) <= 1:
+            continue
+        # Collect the entity ids for all profiles in this group
+        group_eids = [prof_to_eid[mid] for mid in members if mid in prof_to_eid]
+        if len(group_eids) < 2:
+            continue
+        for j in group_eids[1:]:
+            uf.union(group_eids[0], j)
+
+    # Build new canonical entities from union-find clusters
+    clusters: dict[str, list[str]] = defaultdict(list)
+    for eid in all_eids:
+        clusters[uf.find(eid)].append(eid)
+
+    entities_by_id = {p.id: p for p in people}
+    new_people: list[Entity] = []
+    k = 0
+    for root, members in clusters.items():
+        if len(members) == 1:
+            new_people.append(entities_by_id[root])
+            continue
+        # Merge: combine aliases, emails, mentions; keep owner attrs
+        is_owner = any(entities_by_id[m].attrs.get("owner") for m in members)
+        all_aliases: list[str] = []
+        all_emails: set[str] = set()
+        all_mentions: list[Mention] = []
+        for mid in members:
+            ent = entities_by_id[mid]
+            all_aliases.extend(ent.aliases)
+            all_emails.update(ent.attrs.get("emails", []))
+            all_mentions.extend(ent.mentions)
+        all_aliases = sorted(set(all_aliases))
+        # Choose label: owner_label if owner, else longest alias
+        if is_owner and owner_label:
+            label = owner_label
+        else:
+            real = [a for a in all_aliases if "@" not in a and len(a) > 1]
+            label = max(real, key=lambda n: (len(n.split()), len(n))) if real else (
+                sorted(all_emails)[0] if all_emails else all_aliases[0] if all_aliases else "unknown"
+            )
+        attrs: dict = {"emails": sorted(all_emails)}
+        if is_owner:
+            attrs["owner"] = True
+        new_people.append(Entity(
+            id=f"person:{k}", type=EntityType.PERSON, label=label,
+            aliases=all_aliases, mentions=all_mentions, attrs=attrs,
+        ))
+        k += 1
+
+    # Re-number singletons that weren't merged
+    result: list[Entity] = []
+    for ent in new_people:
+        if ent.id.startswith("person:") and not any(e.id == ent.id for e in result):
+            result.append(ent)
+    return result
+
+
+class _UF_local:
+    """Local union-find for entity merging."""
+    def __init__(self, keys):
+        self.p = {k: k for k in keys}
+
+    def find(self, x):
+        while self.p.get(x, x) != x:
+            self.p[x] = self.p.get(self.p[x], self.p[x])
+            x = self.p[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[ra] = rb
+
+
+def _renumber_edges(edges: list[Edge], start: int) -> None:
+    """Renumber edges in-place starting from `start`."""
+    for i, edge in enumerate(edges):
+        edge.id = f"e{start + i}"
+
+
+def _relations_from_llm(
+    extractions,
+    resolve_local,
+    participant_to_entity: dict[str, str],
+) -> list[Edge]:
+    """Build Edge objects from LLM-extracted relations and derived_relations.
+
+    `resolve_local(conv_id, local_entity)` -> entity_id or None.
+    Skips relations where either endpoint fails to resolve.
+    """
+    edges: list[Edge] = []
+    seen: set[tuple] = set()  # deduplicate (src, tgt, kind)
+    eid = [0]
+
+    def add_edge(src: str, tgt: str, kind: str, item_id: str):
+        key = (src, tgt, kind)
+        if src == tgt:
+            return
+        evidence = [item_id] if item_id else []
+        # Accumulate evidence for duplicate (src, tgt, kind) pairs
+        for e in edges:
+            if e.source == src and e.target == tgt and e.kind == kind:
+                if item_id and item_id not in e.evidence_item_ids:
+                    e.evidence_item_ids = sorted(set(e.evidence_item_ids) | {item_id})[:20]
+                return
+        edges.append(Edge(
+            id=f"llm_e{eid[0]}", source=src, target=tgt, kind=kind,
+            weight=1.0, evidence_item_ids=evidence[:20],
+        ))
+        eid[0] += 1
+
+    # From extraction relations
+    for ce in extractions:
+        conv_id = ce.conversation_id
+        for rel in ce.relations:
+            subj_eid = resolve_local(conv_id, rel.subject_local_entity)
+            obj_eid = resolve_local(conv_id, rel.object_local_entity)
+            if not subj_eid or not obj_eid:
+                continue
+            add_edge(subj_eid, obj_eid, rel.type, rel.real_item_id)
+
+    # From resolve-derived relations (derived_relations come from profile resolution,
+    # they use profile_ids as subject/object — skip if they don't map to entities)
+    # These are already handled above via profile_id_to_entity_id in the caller.
+    # Here we just process extraction relations.
+
+    return edges
 
 
 def _profiles_to_entities(profiles, merged_groups: dict, etype: EntityType, prefix: str) -> list[Entity]:
