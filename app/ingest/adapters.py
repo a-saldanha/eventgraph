@@ -7,7 +7,10 @@ OCR stage — they return a clear placeholder instead of failing the whole uploa
 """
 from __future__ import annotations
 
+import mailbox
+import os
 import re
+import tempfile
 from datetime import datetime
 from email import message_from_bytes
 from email.utils import parsedate_to_datetime
@@ -45,23 +48,15 @@ def parse_upload(filename: str, data: bytes) -> list[SourceItem]:
 
 # ---- PDF via LlamaParse ---------------------------------------------------
 def _llama_key() -> str:
-    import os
-    import re
-    from pathlib import Path as _P
-
+    """Read the LlamaParse key from the environment, or from this project's .env."""
     key = os.getenv("LLAMA_CLOUD_API_KEY", "")
     if key:
         return key
-    # this project's own .env first, then the sibling invoice project's (legacy)
-    candidates = (
-        _P(__file__).resolve().parents[2] / ".env",
-        _P(__file__).resolve().parents[3] / "backend" / ".env",
-    )
-    for env in candidates:
-        if env.exists():
-            m = re.search(r"LLAMA_CLOUD_API_KEY=(\S+)", env.read_text())
-            if m and m.group(1).startswith("llx-"):
-                return m.group(1)
+    env = Path(__file__).resolve().parents[2] / ".env"
+    if env.exists():
+        m = re.search(r"LLAMA_CLOUD_API_KEY=(\S+)", env.read_text())
+        if m and m.group(1).startswith("llx-"):
+            return m.group(1)
     return ""
 
 
@@ -155,8 +150,6 @@ def _from_pdf(filename: str, data: bytes) -> list[SourceItem]:
 
 
 def _from_markdown(filename: str, data: bytes) -> list[SourceItem]:
-    import tempfile
-
     with tempfile.NamedTemporaryFile("wb", suffix=".md", delete=False) as f:
         f.write(data)
         tmp = f.name
@@ -252,9 +245,6 @@ def _from_eml(filename: str, data: bytes, index: int) -> list[SourceItem]:
 
 
 def _from_mbox(filename: str, data: bytes) -> list[SourceItem]:
-    import mailbox
-    import tempfile
-
     with tempfile.NamedTemporaryFile("wb", suffix=".mbox", delete=False) as f:
         f.write(data)
         tmp = f.name

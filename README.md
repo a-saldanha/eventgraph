@@ -45,27 +45,22 @@ Prototype persistence is a JSON snapshot at `.cache/bundle.json` (rebuilt from
 This is a self-contained project. It ships with a prebuilt graph, so the backend serves
 answers immediately — **no API key required** for the default (already-built) bundle.
 
-### Backend
+### Backend (default port 8000)
 
 ```bash
-cd knowledge-graph
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env          # optional; only needed to re-run LLM extraction
-uvicorn app.api:app --host 127.0.0.1 --port 8021
+uvicorn app.api:app --host 127.0.0.1 --port 8000
 ```
 
-### Frontend
+### Frontend (default port 3000)
 
 ```bash
 cd frontend
 npm install
-NEXT_PUBLIC_API_BASE=http://localhost:8021 npm run dev -- --port 3002
+npm run dev                   # reads NEXT_PUBLIC_API_BASE, defaults to http://localhost:8000
 ```
-
-> **Port note.** A copy of this app may already be running from the original
-> `../eventgraph` on **3001** (frontend) / **8020** (backend). This standalone copy uses
-> **8021 / 3002** above to avoid a clash — change them freely.
 
 ### Tests
 
@@ -80,9 +75,9 @@ python -m pytest -q          # ingestion + dedup spine
 
 The default `.cache/bundle.json` was built from the redacted corpus, so the app runs
 with **no credentials**. To re-run extraction on new data, set a key in `.env`
-(`LLM_API_KEY=sk-ant-...`). If unset, the key is read from `../backend/.env` when present;
-with no key anywhere, the pipeline falls back to the deterministic heuristic path
-(`MockLLM`). Ingesting raw PDFs additionally needs `LLAMA_CLOUD_API_KEY`.
+(`LLM_API_KEY=sk-ant-...`) or the environment. With no key, the pipeline falls back to
+the deterministic heuristic path (`MockLLM`). Ingesting raw PDFs additionally needs
+`LLAMA_CLOUD_API_KEY`.
 
 - **Extraction:** `claude-sonnet-4-6` (batched + cached in `.cache/llm/`)
 - **NL query:** `claude-opus-4-8`

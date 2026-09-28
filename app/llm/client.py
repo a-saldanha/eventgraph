@@ -6,7 +6,9 @@ This keeps the model swappable and lets tests / offline runs use the mock.
 from __future__ import annotations
 
 import os
+import re
 import time
+from pathlib import Path
 from typing import Protocol
 
 
@@ -54,23 +56,15 @@ class AnthropicLLM:
 
 
 def _read_key() -> str:
-    # env first; fall back to the sibling invoice project's .env for local dev
+    """Read the Anthropic key from the environment, or from this project's .env."""
     key = os.getenv("LLM_API_KEY") or os.getenv("ANTHROPIC_API_KEY", "")
     if key:
         return key
-    from pathlib import Path
-    import re
-
-    # this project's own .env first, then the sibling invoice project's (legacy)
-    candidates = (
-        Path(__file__).resolve().parents[2] / ".env",
-        Path(__file__).resolve().parents[3] / "backend" / ".env",
-    )
-    for p in candidates:
-        if p.exists():
-            m = re.search(r"(?:LLM_API_KEY|ANTHROPIC_API_KEY)=(\S+)", p.read_text())
-            if m and m.group(1).startswith("sk-ant"):
-                return m.group(1)
+    env = Path(__file__).resolve().parents[2] / ".env"
+    if env.exists():
+        m = re.search(r"(?:LLM_API_KEY|ANTHROPIC_API_KEY)=(\S+)", env.read_text())
+        if m and m.group(1).startswith("sk-ant"):
+            return m.group(1)
     return ""
 
 

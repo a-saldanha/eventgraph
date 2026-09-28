@@ -120,3 +120,45 @@ question taxonomy is more predictable and honest for a demo.
   toy.
 - WhatsApp export has out-of-order timestamps and invisible bidi marks (U+200E etc.);
   kept in raw, stripped only for hashing/matching.
+
+---
+
+# Rebuild log
+
+The sections above predate the current rebuild and are kept for now; they are
+restructured in Phase 10. Entries below are added per phase.
+
+## Phase 0 — baseline and hygiene
+
+### D0.1 — One diagnostic report drives every phase
+**Chose:** `scripts/graph_report.py`, reporting entity counts, unknown-person count,
+the owner entity, top correspondents, duplicate label groups, and isolated-entity
+percentage, over a saved bundle or a fresh build. Baseline saved in `docs/baseline.md`.
+**Alternatives:** ad-hoc queries per phase; assertions only in tests.
+**Reasoning:** the later phases target measurable ER/dedup defects; a single report run
+before and after each phase is how those numbers are tracked without re-deriving them.
+**Cut:** nothing.
+
+### D0.2 — Resolve named timezone abbreviations with a fixed map
+**Chose:** a `_TZINFOS` map (EET, EEST, CET, IST, US zones, …) passed to dateutil, and
+removal of the blanket `warnings.filterwarnings("ignore")` that hid the failure.
+**Alternatives:** keep suppressing the warning; store naive datetimes.
+**Reasoning:** a header reading `14:22 EET` was parsed to a naive datetime, so ordering
+across channels was off by the offset. The map makes those timestamps aware; a numeric
+offset in the header is still parsed directly. Ambiguous abbreviations (IST) resolve to
+the corpus region.
+**Cut:** full IANA abbreviation coverage; only observed zones are mapped.
+
+### D0.3 — One project name, keys and ports from the environment
+**Chose:** the name EventGraph across the app; the Anthropic and LlamaParse keys read
+from the environment or this project's `.env` only; backend on 8000 and the frontend on
+`NEXT_PUBLIC_API_BASE` (default 8000).
+**Alternatives:** the previous fallback to a sibling project's `.env`.
+**Reasoning:** the fallback coupled the app to an unrelated local directory and leaked
+into the docs. Removing it makes the project self-contained.
+**Cut:** the sibling `.env` fallback; the one-off `restore_*` scripts and `.backups/`.
+
+### Mistakes and what I changed
+- Dead `reasons` dict in `resolve_people` was written and never read; removed.
+- `scripts/ingest_stats.py` still probed for pre-rebuild pseudonyms that no longer occur
+  in the data; removed that block.

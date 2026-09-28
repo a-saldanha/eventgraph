@@ -27,7 +27,7 @@ export default function Page() {
   return (
     <div className="app">
       <div className="top">
-        <span className="brand">Event Knowledge Graph</span>
+        <span className="brand">EventGraph</span>
         <div className="tabs">
           {TABS.map((t) => (
             <button key={t} className={tab === t ? "active" : ""} onClick={() => setTab(t)}>{t}</button>

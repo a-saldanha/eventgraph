@@ -6,15 +6,12 @@ of canned cross-source queries with citations + highlighted sub-graph.
 """
 from __future__ import annotations
 
-import warnings
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-
-warnings.filterwarnings("ignore")
 
 from .ingest.markdown import parse_batch_file
 from .jobs import JobManager
@@ -41,7 +38,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Event Knowledge Graph", lifespan=lifespan)
+app = FastAPI(title="EventGraph", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 

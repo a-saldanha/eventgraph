@@ -6,12 +6,10 @@ Usage:  python -m scripts.ingest_stats [../processed_data]
 from __future__ import annotations
 
 import sys
-import warnings
 from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-warnings.filterwarnings("ignore")
 
 from app.ingest.dedup import find_duplicates
 from app.ingest.markdown import parse_batch_file
@@ -34,15 +32,6 @@ def main() -> None:
     print(f"  near clusters: {len(res.near_clusters)}  (redundant copies {res.n_near_dupes})")
     unique = len(items) - res.n_exact_dupes - res.n_near_dupes
     print(f"  ~unique items after dedup: {unique}")
-
-    # entity-resolution teaser: surface forms of the trip owner
-    forms = Counter()
-    for it in items:
-        blob = f"{it.sender} {it.recipients}".lower()
-        for f in ("r0h@n", "rohan menezes", "menezes rohan"):
-            if f in blob:
-                forms[f] += 1
-    print("\nER preview — surface forms of one person across items:", dict(forms))
 
 
 if __name__ == "__main__":

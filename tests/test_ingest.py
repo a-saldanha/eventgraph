@@ -1,5 +1,6 @@
 """Unit tests for the deterministic ingestion spine (parser + dedup)."""
 import textwrap
+from datetime import timedelta
 
 from app.ingest.dedup import find_duplicates
 from app.ingest.markdown import _norm_subject, parse_batch_file, parse_timestamp
@@ -73,6 +74,15 @@ def test_timestamp_parsing_per_source():
     assert parse_timestamp(SourceType.EMAIL, "Fri, 22 May 2026 03:03:36 -0400").year == 2026
     assert parse_timestamp(SourceType.WHATSAPP, "[18/03/26, 9:31:24 PM]").hour == 21
     assert parse_timestamp(SourceType.PDF, "n/a (undated certificate)") is None
+
+
+def test_timestamp_resolves_named_timezone_abbreviation():
+    # dateutil can't resolve bare "EET" without a tzinfos map; we supply one so the
+    # result is timezone-aware (+2h) instead of silently dropping the zone.
+    ts = parse_timestamp(SourceType.PDF, "2 Mar 2024 14:22 EET")
+    assert ts is not None and ts.utcoffset() == timedelta(hours=2)
+    ts_eest = parse_timestamp(SourceType.PDF, "2 Jul 2024 14:22 EEST")
+    assert ts_eest is not None and ts_eest.utcoffset() == timedelta(hours=3)
 
 
 def test_exact_and_near_duplicates(tmp_path):

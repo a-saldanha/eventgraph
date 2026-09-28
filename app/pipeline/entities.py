@@ -113,18 +113,15 @@ def resolve_person_mentions(raw) -> tuple[list[Entity], list[MergeRecord]]:
         if len(nn) >= 3:
             by_name[nn].append(i)
 
-    reasons: dict[tuple, str] = {}
     for group in by_email.values():
         for j in group[1:]:
             uf.union(group[0], j)
-    for stem, group in by_stem.items():
+    for group in by_stem.values():
         for j in group[1:]:
             uf.union(group[0], j)
-            reasons[(uf.find(group[0]),)] = f"shared email stem '{stem}'"
-    for nn, group in by_name.items():
+    for group in by_name.values():
         for j in group[1:]:
             uf.union(group[0], j)
-            reasons[(uf.find(group[0]),)] = f"name match after normalization ('{nn}')"
 
     # assemble canonical entities
     clusters: dict[int, list[int]] = defaultdict(list)

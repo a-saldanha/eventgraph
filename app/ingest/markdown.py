@@ -14,6 +14,24 @@ import re
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+
+from dateutil import parser as dparser
+
+# dateutil can't resolve bare timezone abbreviations on its own. Map the common
+# ones to a fixed UTC offset (seconds) so a header like "... 14:22 EET" parses to
+# an aware datetime instead of warning and dropping the zone. Regionally ambiguous
+# abbreviations (IST) resolve to the corpus's region.
+_TZINFOS = {
+    "UTC": 0, "GMT": 0, "Z": 0,
+    "EET": 2 * 3600, "EEST": 3 * 3600,
+    "CET": 1 * 3600, "CEST": 2 * 3600,
+    "BST": 1 * 3600, "WET": 0, "WEST": 3600,
+    "IST": int(5.5 * 3600),  # India Standard Time
+    "EST": -5 * 3600, "EDT": -4 * 3600,
+    "CST": -6 * 3600, "CDT": -5 * 3600,
+    "MST": -7 * 3600, "MDT": -6 * 3600,
+    "PST": -8 * 3600, "PDT": -7 * 3600,
+}
 from typing import Optional
 
 from ..schema import Provenance, SourceItem, SourceType
@@ -202,10 +220,8 @@ def parse_timestamp(stype: SourceType, raw: str) -> Optional[datetime]:
                 return datetime.strptime(cleaned, fmt)
             except ValueError:
                 continue
-    # Generic fallback (PDF/Excel/misc): dateutil, tolerating trailing tz words.
+    # Generic fallback (PDF/Excel/misc): dateutil, resolving known tz abbreviations.
     try:
-        from dateutil import parser as dparser
-
-        return dparser.parse(raw, fuzzy=True)
-    except Exception:
+        return dparser.parse(raw, fuzzy=True, tzinfos=_TZINFOS)
+    except (ValueError, OverflowError):
         return None
