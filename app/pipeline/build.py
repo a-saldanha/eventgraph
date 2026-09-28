@@ -117,20 +117,85 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
         _renumber_edges(llm_edges, start=len(edges))
         edges = edges + llm_edges
 
+    # Deterministic post-merge: collapse entities that share a normalized name, so
+    # e.g. 23 separate "Srinivasa" WhatsApp mentions become one person and duplicate
+    # org/location surfaces merge. Edges are remapped and de-duplicated onto the
+    # canonical entity. This restores name-based merging the LLM path alone misses.
+    all_entities, edges = _collapse_by_name(all_entities, edges)
+    _renumber_edges(edges, start=0)
+
     graph = EventGraph(entities=all_entities, edges=edges, merges=all_merges, relevance=relevance)
     timeline = _timeline(subevents, items)
+    n_people = sum(1 for e in all_entities if e.type == EntityType.PERSON)
     stats = {
         "items": len(items), "canonical_items": len(canon_items),
         "relevant_items": len(relevant_ids),
         "exact_dupes": dedup.n_exact_dupes, "near_dupes": dedup.n_near_dupes,
         "entities": len(all_entities), "edges": len(edges),
-        "people": len(people), "merges": len(all_merges), "mode": mode,
+        "people": n_people, "merges": len(all_merges), "mode": mode,
         "owner": owner.label, "owner_confident": owner.confident,
         "resolve_label": resolve_label,
         "review_queue": len(review_queue),
     }
     return Bundle(items=items, dedup=dedup, graph=graph, timeline=timeline, stats=stats,
                   review_queue=review_queue, item_topics=item_topics)
+
+
+def _norm_name(label: str, etype) -> str:
+    """Normalized merge key. People are order-insensitive and alpha-only so
+    'Menezes Rohan' == 'Rohan Menezes' and 'Srinivasa' variants collapse; orgs and
+    locations keep word order (punctuation/case stripped)."""
+    s = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", (label or "").lower())).strip()
+    if etype == EntityType.PERSON:
+        toks = sorted(t for t in re.sub(r"[^a-z ]", " ", s).split() if len(t) > 1)
+        return " ".join(toks)
+    return s
+
+
+def _collapse_by_name(entities: list[Entity], edges: list[Edge]):
+    """Merge same-type entities that share a normalized name; remap + dedup edges."""
+    groups: dict[tuple, list[Entity]] = defaultdict(list)
+    for e in entities:
+        groups[(e.type, _norm_name(e.label, e.type))].append(e)
+
+    remap: dict[str, str] = {}
+    merged: list[Entity] = []
+    for (etype, norm), group in groups.items():
+        if not norm or len(group) == 1:
+            merged.extend(group)
+            continue
+        canon = max(group, key=lambda e: (len(e.mentions), len(e.label)))
+        seen = {(m.item_id, m.text) for m in canon.mentions}
+        for e in group:
+            if e is canon:
+                continue
+            remap[e.id] = canon.id
+            for m in e.mentions:
+                if (m.item_id, m.text) not in seen:
+                    canon.mentions.append(m)
+                    seen.add((m.item_id, m.text))
+            canon.aliases = sorted(set(canon.aliases) | set(e.aliases) | {e.label})
+            emails = set(canon.attrs.get("emails", [])) | set(e.attrs.get("emails", []))
+            if emails:
+                canon.attrs["emails"] = sorted(emails)
+        merged.append(canon)
+
+    by_key: dict[tuple, Edge] = {}
+    out: list[Edge] = []
+    for ed in edges:
+        s, t = remap.get(ed.source, ed.source), remap.get(ed.target, ed.target)
+        if s == t:
+            continue
+        key = (s, t, ed.kind)
+        if key in by_key:
+            ex = by_key[key]
+            ex.weight += ed.weight
+            ex.evidence_item_ids = sorted(set(ex.evidence_item_ids) | set(ed.evidence_item_ids))[:20]
+        else:
+            ed.source, ed.target = s, t
+            by_key[key] = ed
+            out.append(ed)
+    return merged, out
 
 
 def _mark_duplicates(items: list[SourceItem], dedup: DedupResult) -> None:
@@ -226,7 +291,10 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
         review_queue.extend(org_bundle.review_queue)
         orgs = _profiles_to_entities(org_profiles, org_bundle.merged_groups, EntityType.ORG, "org")
     else:
-        orgs = _domain_orgs_heuristic(people, start_index=0)
+        orgs = []
+    # Always add domain-derived orgs: they carry member_person_ids, which drive the
+    # person->org affiliated_with edges. Duplicate labels merge in _collapse_by_name.
+    orgs = orgs + _domain_orgs_heuristic(people, start_index=len(orgs))
 
     loc_profiles = [p for p in all_ext_profiles if p.type == "location"]
     if loc_profiles:
