@@ -123,16 +123,20 @@ def run_full(items, model: str, out_path: Path, concurrency: int) -> None:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Serialize the bundle to JSON.
-    graph_data = {
-        "stats": bundle.stats,
-        "entities": [e.model_dump() for e in bundle.graph.entities],
-        "edges": [e.model_dump() for e in bundle.graph.edges],
-        "merges": [m.model_dump() for m in bundle.graph.merges],
-        "relevance": [r.model_dump() for r in bundle.graph.relevance],
+    # Serialize in the store format the app loads (items + nested graph + dedup),
+    # so the built bundle can be served directly by app/store.py::load_bundle.
+    data = {
+        "items": [it.model_dump(mode="json") for it in bundle.items],
+        "graph": bundle.graph.model_dump(mode="json"),
         "timeline": bundle.timeline,
+        "stats": bundle.stats,
+        "dedup": {
+            "exact_groups": bundle.dedup.exact_groups,
+            "near_clusters": bundle.dedup.near_clusters,
+            "canonical": bundle.dedup.canonical,
+        },
     }
-    out_path.write_text(json.dumps(graph_data, default=str, indent=2))
+    out_path.write_text(json.dumps(data, default=str))
     print(f"\nBundle written to: {out_path}")
 
 
