@@ -2,10 +2,19 @@
 
 The pipeline never imports the vendor SDK directly — it calls `get_llm_client()`.
 This keeps the model swappable and lets tests / offline runs use the mock.
+
+Model IDs come exclusively from environment variables:
+  LLM_EXTRACT_MODEL  — extraction (cheap); default claude-haiku-4-5
+  LLM_RESOLVE_MODEL  — resolution;        default claude-sonnet-4-6
+  LLM_QUERY_MODEL    — NL query;          default claude-sonnet-4-6
+
+Retry policy: 429 (rate limit), 5xx (server error), and connection errors use
+exponential backoff with jitter. All other 4xx errors fail fast (no retry).
 """
 from __future__ import annotations
 
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -13,6 +22,16 @@ from typing import Protocol
 
 
 class LLMError(RuntimeError):
+    pass
+
+
+class LLMRateLimitError(LLMError):
+    """Raised when we exhaust retries on a 429."""
+    pass
+
+
+class LLMClientError(LLMError):
+    """Raised immediately on non-retriable 4xx (e.g. 400, 401, 403)."""
     pass
 
 
@@ -26,33 +45,95 @@ class MockLLM:
     still runs without a key (callers treat empty as 'no LLM entities')."""
 
     def complete_json(self, system: str, user: str, max_tokens: int = 4096) -> str:
-        return '{"items": []}'
+        return '{"messages": [], "mentions": [], "relations": []}'
+
+    def complete_tool(self, system: str, user: str, tool: dict, max_tokens: int = 4096) -> str:
+        return '{"messages": [], "mentions": [], "relations": []}'
 
 
 class AnthropicLLM:
-    def __init__(self, api_key: str, model: str):
+    """Thin wrapper around the Anthropic SDK.
+
+    Retry policy:
+      - 429 RateLimitError   → retry with backoff (up to max_retries).
+      - 5xx APIStatusError   → retry with backoff.
+      - APIConnectionError   → retry with backoff.
+      - Other 4xx (400, etc) → raise LLMClientError immediately (no retry).
+    """
+
+    def __init__(self, api_key: str, model: str, max_retries: int = 4):
         if not api_key:
             raise LLMError("LLM_PROVIDER=anthropic but no API key set")
         import anthropic
-
         self._client = anthropic.Anthropic(api_key=api_key)
         self._model = model
+        self._max_retries = max_retries
+
+    def _backoff(self, attempt: int) -> None:
+        base = 2 ** attempt  # 1, 2, 4, 8 seconds
+        jitter = random.uniform(0, base * 0.2)
+        time.sleep(base + jitter)
 
     def complete_json(self, system: str, user: str, max_tokens: int = 4096) -> str:
         import anthropic
-
         last_err = None
-        for attempt in range(4):  # backoff on rate limits / transient errors
+        for attempt in range(self._max_retries):
             try:
                 msg = self._client.messages.create(
                     model=self._model, max_tokens=max_tokens, system=system,
                     messages=[{"role": "user", "content": user}],
                 )
                 return msg.content[0].text
-            except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError) as e:
+            except anthropic.RateLimitError as e:
                 last_err = e
-                time.sleep(2 ** attempt)  # 1,2,4,8s
-        raise LLMError(f"Anthropic failed after retries: {last_err}")
+                self._backoff(attempt)
+            except anthropic.APIStatusError as e:
+                if e.status_code and e.status_code < 500:
+                    # Non-retriable 4xx — fail fast.
+                    raise LLMClientError(f"Anthropic API error {e.status_code}: {e}") from e
+                last_err = e
+                self._backoff(attempt)
+            except anthropic.APIConnectionError as e:
+                last_err = e
+                self._backoff(attempt)
+        raise LLMRateLimitError(f"Anthropic failed after {self._max_retries} retries: {last_err}")
+
+    def complete_tool(self, system: str, user: str, tool: dict, max_tokens: int = 4096) -> str:
+        """Call with tool_choice=tool so the model fills the schema."""
+        import anthropic
+        last_err = None
+        for attempt in range(self._max_retries):
+            try:
+                msg = self._client.messages.create(
+                    model=self._model,
+                    max_tokens=max_tokens,
+                    system=system,
+                    tools=[tool],
+                    tool_choice={"type": "tool", "name": tool["name"]},
+                    messages=[{"role": "user", "content": user}],
+                )
+                # The response is in a tool_use block.
+                for block in msg.content:
+                    if hasattr(block, "type") and block.type == "tool_use":
+                        return json_dumps(block.input)
+                return "{}"
+            except anthropic.RateLimitError as e:
+                last_err = e
+                self._backoff(attempt)
+            except anthropic.APIStatusError as e:
+                if e.status_code and e.status_code < 500:
+                    raise LLMClientError(f"Anthropic API error {e.status_code}: {e}") from e
+                last_err = e
+                self._backoff(attempt)
+            except anthropic.APIConnectionError as e:
+                last_err = e
+                self._backoff(attempt)
+        raise LLMRateLimitError(f"Anthropic failed after {self._max_retries} retries: {last_err}")
+
+
+def json_dumps(obj) -> str:
+    import json
+    return json.dumps(obj)
 
 
 def _read_key() -> str:
@@ -69,10 +150,23 @@ def _read_key() -> str:
 
 
 def get_llm_client(model: str | None = None) -> LLMClient:
-    """Model tiering: pass an explicit model (e.g. a smarter one for querying);
-    otherwise falls back to LLM_MODEL (the cheaper extraction default)."""
+    """Return an LLM client for the given model (or the extraction default).
+
+    Model resolution order:
+      1. Explicit `model` argument.
+      2. LLM_EXTRACT_MODEL env var.
+      3. LLM_MODEL env var (legacy).
+      4. Hard default 'claude-haiku-4-5' (cheapest).
+
+    Never hardcodes a model id — every default is overridable via env.
+    """
     provider = os.getenv("LLM_PROVIDER", "anthropic")
-    model = model or os.getenv("LLM_MODEL", "claude-sonnet-4-6")
+    if model is None:
+        model = (
+            os.getenv("LLM_EXTRACT_MODEL")
+            or os.getenv("LLM_MODEL")
+            or "claude-haiku-4-5"
+        )
     if provider == "mock":
         return MockLLM()
     key = _read_key()
@@ -81,9 +175,16 @@ def get_llm_client(model: str | None = None) -> LLMClient:
     return AnthropicLLM(key, model)
 
 
+def get_resolve_client() -> LLMClient:
+    """Smarter model for entity resolution (Phase 4)."""
+    model = os.getenv("LLM_RESOLVE_MODEL") or os.getenv("LLM_MODEL") or "claude-sonnet-4-6"
+    return get_llm_client(model)
+
+
 def get_query_client() -> LLMClient:
-    """The smarter model used for answering natural-language questions."""
-    return get_llm_client(os.getenv("LLM_QUERY_MODEL", "claude-opus-4-8"))
+    """Smarter model for answering natural-language questions."""
+    model = os.getenv("LLM_QUERY_MODEL") or os.getenv("LLM_MODEL") or "claude-sonnet-4-6"
+    return get_llm_client(model)
 
 
 def llm_available() -> bool:

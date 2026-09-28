@@ -46,7 +46,7 @@ extraction). Owner unified across all 4 channels; 0 unknown persons.
 
 ---
 
-## Phase 3 — LLM mention extraction   [status: NOT STARTED]
+## Phase 3 — LLM mention extraction   [status: DONE]
 **Outcome:** the LLM reads conversation chunks and returns typed mentions + topics +
 relations, each verified against the source; cached and reproducible.
 

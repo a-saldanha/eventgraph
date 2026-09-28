@@ -265,3 +265,46 @@ reports a real owner instead of the "most-mentioned person" fallback.
   `email, excel_row, pdf, whatsapp`.
 - Extraction now runs over 1,044 canonicals (was all 1,482); duplicates no longer inflate
   mentions/counts. 15/15 tests still pass.
+
+## Phase 3 — LLM mention extraction
+
+### D3.1 — Tool-use schema for typed extraction; verify every claim verbatim
+**Chose:** `app/llm/extract.py` calls the LLM with a structured `extract_mentions` tool
+schema (messages/mentions/relations); `app/llm/verify.py` drops any mention whose `surface`
+does not appear verbatim in the stated message, any relation whose `evidence_span` does not
+appear verbatim, any unknown message id, and any out-of-vocabulary mention/relation type.
+**Alternatives:** parse free-text JSON; skip verification; embed the schema as a text hint.
+**Reasoning:** tool-use gives a deterministic JSON structure and eliminates parsing fragility.
+Verification means the LLM cannot hallucinate surfaces or invent message ids; every kept
+fact is grounded. Falling back to the schema-embedded-in-prompt path for clients that do
+not implement `complete_tool` keeps the mock/test path simple.
+**Cut:** Batch API, prompt-caching flags, streaming — all deferred.
+
+### D3.2 — Conversation-grouped ~8k-token chunks with overlap
+**Chose:** `app/llm/chunking.py` groups canonical items by `conversation_id`, sorts by
+timestamp, packs to ~8k input tokens with 5-message overlap at chunk boundaries. Assigns
+chunk-local ids `m1..mN` with a map back to real item ids. Boilerplate lines seen in >= 5
+items are stripped before packing.
+**Alternatives:** fixed batch size on arbitrary item order (old approach); per-item calls.
+**Reasoning:** conversation context matters — the LLM resolves co-references better within
+a conversation. The overlap ensures boundary messages appear in at least two chunks so
+mentions are not split across context windows.
+**Cut:** fixed 8k target (not adaptive); exact-line-match boilerplate only (no fuzzy).
+
+### D3.3 — Model ids from env only; retry only 429/5xx/connection
+**Chose:** `app/llm/client.py` reads model ids from `LLM_EXTRACT_MODEL`, `LLM_RESOLVE_MODEL`,
+`LLM_QUERY_MODEL` (never hardcoded); falls back to `LLM_MODEL` then a per-role default.
+Retry policy: 429, 5xx, and `APIConnectionError` get exponential backoff + jitter; all other
+4xx (including 400) raise `LLMClientError` immediately (no retry).
+**Reasoning:** fast-fail on 400 catches bad model ids and malformed prompts immediately,
+making configuration errors visible. Per-role env vars let extraction stay on Haiku while
+resolution and query use a smarter model.
+**Cut:** nothing significant.
+
+### Checkpoint: dry-run on full corpus
+- 1,044 canonical items → 35 chunks across all conversations.
+- Estimated input tokens: 40,396 (all chunks uncached).
+- Estimated output tokens: 28,000 (uncached, at ~800 output/chunk).
+- Estimated cost (claude-haiku-4-5): input $0.0323, output $0.1120, total $0.1443.
+- 24/24 tests green (19 existing + 5 new in `tests/test_extract.py`).
+- No paid `--confirm` run executed this phase.
