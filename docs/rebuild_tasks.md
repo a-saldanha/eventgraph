@@ -106,7 +106,7 @@ strip can be exact-line-match only.
 estimate, then STOP for approval before the paid `--confirm` run.
 **Commit:** "Phase 3: chunked LLM extraction with verification + build CLI".
 
-## Phase 4 — profiles, blocking, LLM resolution   [status: NOT STARTED]
+## Phase 4 — profiles, blocking, LLM resolution   [status: DONE]
 **Outcome:** duplicate-named orgs/locations and split people are merged by an LLM on
 small candidate blocks; low-confidence merges go to a review queue.
 **Create:** `app/resolve/profiles.py` (aggregate (chunk, local_entity) + Phase-2 identity

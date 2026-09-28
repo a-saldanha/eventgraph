@@ -308,3 +308,50 @@ resolution and query use a smarter model.
 - Estimated cost (claude-haiku-4-5): input $0.0323, output $0.1120, total $0.1443.
 - 24/24 tests green (19 existing + 5 new in `tests/test_extract.py`).
 - No paid `--confirm` run executed this phase.
+
+## Phase 4 — profiles, blocking, LLM resolution
+
+### D4.1 — Profile-based blocking with shared item_id co-occurrence
+**Chose:** `app/resolve/blocking.py` groups profiles by type then unions by identifier,
+email-stem, name token, first-name+channel, org-domain, location containment, and — new
+addition beyond the spec — shared item_id co-occurrence. Caps blocks at 12 profiles.
+**Reasoning:** leet handles and alternate name forms share no clean token with the full name;
+co-occurrence in the same source message is the weakest but most reliable structural signal
+that two mentions *might* be the same entity, warranting an LLM opinion. Without it,
+"J@n3" and "Jane Doe" would never reach the LLM for resolution.
+**Cut:** nothing significant.
+
+### D4.2 — Cannot-link enforces type consistency; canonical name verified against surfaces
+**Chose:** `app/resolve/llm_resolve.py` drops any cluster whose member types conflict or
+whose `canonical_name` is absent from all member surfaces (case-insensitive fallback).
+Low-confidence merges go to `review_queue` in the Bundle, not into the graph.
+**Alternatives:** trust the LLM fully; enforce only on type conflicts.
+**Reasoning:** the spec explicitly requires canonical_name verification and a review queue
+for low-confidence decisions. Invented names are a known LLM failure mode.
+**Cut:** derived_relations are collected but not yet wired into graph edges (Phase 5).
+
+### D4.3 — Heuristic fallback: identifier-only merges, no name-similarity
+**Chose:** `resolve_people(..., identifier_only=True)` — merges only on exact email/phone
+match. Deleted `_leet_norm`, `DOMAIN_ORG`, `LOCATIONS`, `SUBEVENTS` gazetteers, `_group_llm`,
+`_domain_orgs`, and `resolve_person_mentions` (replaced by private `_resolve_person_mentions`).
+Domain-derived orgs (generic, any corpus) kept as heuristic org source. Locations = [] in
+heuristic mode.
+**Reasoning:** removing name-similarity from the heuristic path makes false-positive merges
+visible and assigns them to the LLM. The spec says "It is FINE if heuristic shows fewer
+orgs/locations now."
+**Cut:** SUBEVENTS keywords kept (generic; no corpus-specific strings remain).
+
+### Checkpoint: heuristic graph_report before/after
+BEFORE (Phase 3 baseline):
+  person=25, org=15, location=2, money=5, doc=7, subevent=7
+  isolated=17/61 (27.9%), merges=6, review queue=0
+
+AFTER Phase 4 (heuristic mode, no LLM):
+  person=104, org=9, location=0, money=5, doc=7, subevent=7
+  isolated=88/132 (66.7%), merges=7, review queue=0
+
+  People count rose (104 vs 25) because leet-name merging was removed from the heuristic
+  path — that work now belongs to the LLM resolver. Orgs dropped (9 vs 15) because the
+  corpus-specific DOMAIN_ORG gazetteer was deleted. Locations = 0 (corpus-specific LOCATIONS
+  gazetteer deleted). Isolated entities rose accordingly. These are expected, correct changes.
+  31/31 tests green (24 existing + 7 new in tests/test_resolve_llm.py). No paid runs.
