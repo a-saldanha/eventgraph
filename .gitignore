@@ -1,0 +1,27 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# node / next
+frontend/node_modules/
+frontend/node_modules
+frontend/.next/
+
+# secrets
+.env
+
+# un-redacted exports and anything derived from them — local only, never committed
+raw/
+*.private.*
+.cache/llm/raw/
+
+# runtime cache — regenerable from the committed corpus
+.cache/
+.cache.backup/
+
+# local UI snapshots
+.backups/
+
+.DS_Store
