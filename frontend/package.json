@@ -1,5 +1,5 @@
 {
-  "name": "eventgraph-frontend",
+  "name": "event-graph-frontend",
   "version": "0.1.0",
   "private": true,
   "scripts": {
