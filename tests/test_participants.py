@@ -1,6 +1,6 @@
 """Header/contact parsing into typed participants. Invented data only."""
 from app.ingest.adapters import UnsupportedUpload, parse_upload
-from app.ingest.participants import build_participants, normalize_phone, phonenumbers
+from app.ingest.participants import build_participants, normalize_phone
 from app.schema import SourceType
 
 EML = SourceType.EMAIL
@@ -43,11 +43,11 @@ def test_bidi_marks_stripped_for_matching_but_kept_in_raw():
 
 
 def test_phone_variants_normalize_to_same_e164():
-    a = normalize_phone("+44 20 7946 0958")
-    b = normalize_phone("0044-20-7946-0958")
-    assert a == b
-    if phonenumbers is None:            # deterministic fallback path
-        assert a == "+442079460958"
+    # International and national formats of one US number (default region) normalize
+    # identically, whether via phonenumbers or the deterministic fallback.
+    a = normalize_phone("+1 (212) 736-5000")
+    b = normalize_phone("212-736-5000")
+    assert a == b == "+12127365000"
 
 
 def test_whatsapp_group_title_is_not_a_person():
