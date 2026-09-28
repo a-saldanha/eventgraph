@@ -35,8 +35,8 @@ def test_parses_email_with_multiline_fromto_and_fenced_body(tmp_path):
     assert len(items) == 1
     it = items[0]
     assert it.source_type == SourceType.EMAIL
-    assert it.sender == "Matteo Rinaldi <matteo.rinaldi@kuni.eu>"
-    assert "rohan0707.menezes@gmail.com" in it.recipients
+    assert it.sender_display == "Matteo Rinaldi"
+    assert "rohan0707.menezes@gmail.com" in it.emails()
     assert it.subject == "[RESEND] Link to rebuttal form"
     assert "code is 715903264" in it.body
     assert it.notes.startswith("Resend")  # captured but eval-only

@@ -35,6 +35,7 @@ _TZINFOS = {
 from typing import Optional
 
 from ..schema import Provenance, SourceItem, SourceType
+from .participants import build_participants
 
 _ITEM_RE = re.compile(r"^---\s*ITEM\s+(\d+)\s*---\s*$")
 _SECTION_RE = re.compile(r"^##\s+(.*?)\s*$")
@@ -125,7 +126,10 @@ def _parse_block(block: list[str], item_index: int, batch_file: str, section: Op
 
     body = "\n".join(body_lines).strip("\n")
     source_type = _coerce_type(fields.get("source_type", ""))
-    sender, recipients = _split_fromto(fields.get("fromto", ""))
+    from_val, to_val, cc_val = _fromto_fields(fields.get("fromto", ""))
+    participants = build_participants(
+        source_type, from_val, to_val, cc_val, group_title=section
+    )
     channel = fields.get("channel", "").strip()
     subject = (fields.get("subject", "") or "").strip() or None
     ts_raw = fields.get("timestamp", "").strip()
@@ -137,8 +141,7 @@ def _parse_block(block: list[str], item_index: int, batch_file: str, section: Op
         conversation_id=_conversation_id(source_type, channel, section, subject),
         timestamp_raw=ts_raw,
         timestamp=parse_timestamp(source_type, ts_raw),
-        sender=sender,
-        recipients=recipients,
+        participants=participants,
         subject=subject,
         body=body,
         notes=(fields.get("notes", "") or "").strip(),
@@ -156,20 +159,23 @@ def _coerce_type(raw: str) -> SourceType:
     return SourceType.OTHER
 
 
-def _split_fromto(raw: str) -> tuple[str, str]:
-    sender, recipients = "", ""
+def _fromto_fields(raw: str) -> tuple[str, str, str]:
+    """Split a `from:/to:/cc:` block into raw (from, to, cc) strings."""
+    from_val, to_parts, cc_parts = "", [], []
     for part in raw.split("\n"):
         p = part.strip()
         low = p.lower()
         if low.startswith("from:"):
-            sender = p[5:].strip()
+            from_val = p[5:].strip()
         elif low.startswith("to:"):
-            recipients = (recipients + ", " + p[3:].strip()).strip(", ")
-        elif low.startswith(("reply-to:", "cc:")):
+            to_parts.append(p[3:].strip())
+        elif low.startswith("cc:"):
+            cc_parts.append(p[3:].strip())
+        elif low.startswith("reply-to:"):
             continue
-        elif not sender:  # bare value, treat as sender
-            sender = p
-    return sender, recipients
+        elif not from_val:  # bare value, treat as sender
+            from_val = p
+    return from_val, ", ".join(to_parts), ", ".join(cc_parts)
 
 
 # Either a "Re:/Fwd:/Fw:" prefix (separator required, longest-first so Fwd isn't

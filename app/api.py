@@ -154,7 +154,7 @@ def items(source_type: str | None = None, relevant: bool | None = None,
             {"id": it.id, "source_type": it.source_type.value, "channel": it.channel,
              "conversation_id": it.conversation_id,
              "timestamp": it.timestamp.isoformat() if it.timestamp else None,
-             "sender": it.sender, "subject": it.subject,
+             "sender": it.sender_display, "subject": it.subject,
              "preview": it.body[:140],
              "relevant": rel[it.id].relevant, "relevance_rationale": rel[it.id].rationale}
             for it in page
@@ -175,8 +175,9 @@ def item(item_id: str):
         "id": it.id, "source_type": it.source_type.value, "channel": it.channel,
         "conversation_id": it.conversation_id,
         "timestamp": it.timestamp.isoformat() if it.timestamp else None,
-        "sender": it.sender, "recipients": it.recipients, "subject": it.subject,
-        "body": it.body, "notes": it.notes,
+        "sender": it.sender_display, "recipients": it.recipients_display,
+        "participants": [p.model_dump() for p in it.participants],
+        "subject": it.subject, "body": it.body, "notes": it.notes,
         "relevance": rel.model_dump() if rel else None,
         "entities": ents,
     }

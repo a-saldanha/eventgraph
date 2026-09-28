@@ -7,6 +7,8 @@ OCR stage — they return a clear placeholder instead of failing the whole uploa
 """
 from __future__ import annotations
 
+import csv
+import io
 import mailbox
 import os
 import re
@@ -18,9 +20,11 @@ from pathlib import Path
 
 from ..schema import Provenance, SourceItem, SourceType
 from .markdown import _norm_subject, parse_batch_file, parse_timestamp
+from .participants import build_participants
 
-SUPPORTED_NOW = {".md", ".txt", ".eml", ".mbox", ".pdf"}
-DEFERRED = {".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".csv"}
+# Binary formats we can't read without an OCR/spreadsheet stage. They return a
+# clear per-file error rather than being parsed as garbage text.
+BINARY_UNSUPPORTED = {".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".gif", ".zip"}
 
 
 class UnsupportedUpload(ValueError):
@@ -39,11 +43,13 @@ def parse_upload(filename: str, data: bytes) -> list[SourceItem]:
         return _from_mbox(filename, data)
     if ext == ".pdf":
         return _from_pdf(filename, data)
-    if ext in DEFERRED:
-        raise UnsupportedUpload(
-            f"{ext} needs the OCR/spreadsheet stage — skipped for now."
-        )
-    raise UnsupportedUpload(f"unrecognized file type: {ext}")
+    if ext == ".csv":
+        return _from_csv(filename, data)
+    if ext in BINARY_UNSUPPORTED:
+        raise UnsupportedUpload(f"{ext} files need an OCR/spreadsheet stage that isn't wired yet.")
+    # Unknown text format: keep the whole file as one item; a later optional LLM
+    # step can fill participants, validated like any other LLM output.
+    return _from_text(filename, data)
 
 
 # ---- PDF via LlamaParse ---------------------------------------------------
@@ -139,7 +145,7 @@ def _from_pdf(filename: str, data: bytes) -> list[SourceItem]:
             id=f"{stem}#p{i}", source_type=SourceType.PDF,
             channel="file-upload", conversation_id=f"document:{stem}",
             timestamp=doc_date, timestamp_raw=(doc_date.date().isoformat() if doc_date else ""),
-            sender="", recipients="", subject=filename, body=text,
+            participants=[], subject=filename, body=text,
             provenance=Provenance(batch_file=filename, item_index=i),
         )
         it.content_hash = it.compute_hash()
@@ -186,7 +192,9 @@ def _from_whatsapp_txt(filename: str, data: bytes) -> list[SourceItem]:
             channel=f"whatsapp:{chat}", conversation_id=f"whatsapp:{chat}",
             timestamp_raw=raw_ts,
             timestamp=parse_timestamp(SourceType.WHATSAPP, f"[{raw_ts}]"),
-            sender=cur["sender"], recipients="",
+            participants=build_participants(
+                SourceType.WHATSAPP, from_val=cur["sender"], group_title=chat
+            ),
             body="\n".join(cur["lines"]).strip(),
             provenance=Provenance(batch_file=filename, item_index=idx, section=chat),
         )
@@ -232,7 +240,10 @@ def _item_from_message(msg, filename: str, index: int) -> SourceItem:
         id=f"{Path(filename).stem}#{index}", source_type=SourceType.EMAIL,
         channel="email", conversation_id=f"email-thread:{_norm_subject(subject or '')}",
         timestamp_raw=ts_raw, timestamp=ts,
-        sender=msg.get("From", ""), recipients=msg.get("To", ""),
+        participants=build_participants(
+            SourceType.EMAIL, from_val=msg.get("From", ""),
+            to_val=msg.get("To", ""), cc_val=msg.get("Cc", ""),
+        ),
         subject=subject, body=_msg_body(msg).strip(),
         provenance=Provenance(batch_file=filename, item_index=index),
     )
@@ -250,3 +261,38 @@ def _from_mbox(filename: str, data: bytes) -> list[SourceItem]:
         tmp = f.name
     box = mailbox.mbox(tmp)
     return [_item_from_message(m, filename, i + 1) for i, m in enumerate(box)]
+
+
+# ---- .csv rows / generic text --------------------------------------------
+def _from_csv(filename: str, data: bytes) -> list[SourceItem]:
+    text = data.decode("utf-8", errors="replace")
+    rows = [r for r in csv.reader(io.StringIO(text)) if any(c.strip() for c in r)]
+    if len(rows) < 2:
+        raise UnsupportedUpload(f"{filename} has no data rows.")
+    header, stem, items = rows[0], Path(filename).stem, []
+    for i, row in enumerate(rows[1:], start=1):
+        body = "; ".join(f"{h}: {v}" for h, v in zip(header, row) if v.strip())
+        it = SourceItem(
+            id=f"{stem}#r{i}", source_type=SourceType.EXCEL_ROW,
+            channel="file-upload", conversation_id=f"sheet:{stem}",
+            participants=[], subject=filename, body=body,
+            provenance=Provenance(batch_file=filename, item_index=i),
+        )
+        it.content_hash = it.compute_hash()
+        items.append(it)
+    return items
+
+
+def _from_text(filename: str, data: bytes) -> list[SourceItem]:
+    text = data.decode("utf-8", errors="replace").strip()
+    if not text:
+        raise UnsupportedUpload(f"{filename} is empty or unreadable.")
+    stem = Path(filename).stem
+    it = SourceItem(
+        id=f"{stem}#1", source_type=SourceType.OTHER,
+        channel="file-upload", conversation_id=f"file:{stem}",
+        participants=[], subject=filename, body=text,
+        provenance=Provenance(batch_file=filename, item_index=1),
+    )
+    it.content_hash = it.compute_hash()
+    return [it]

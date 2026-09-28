@@ -11,9 +11,17 @@ import hashlib
 import re
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+IdType = Literal["email", "phone", "handle", "none"]
+ParticipantRole = Literal["sender", "recipient", "cc", "member"]
+# Kinds a participant can be classified as at parse time. "unknown" defers the
+# person/not-person decision to the resolution phase rather than guessing.
+ParticipantKind = Literal[
+    "person", "group", "org", "system", "self", "placeholder", "unknown"
+]
 
 
 class SourceType(str, Enum):
@@ -34,6 +42,24 @@ class Provenance(BaseModel):
     section: Optional[str] = None  # e.g. WhatsApp chat header this item sits under
 
 
+class Participant(BaseModel):
+    """One party on a message: a typed handle parsed from a header or export.
+
+    `raw` keeps the exact original text (invisible marks included) for provenance;
+    `id_value` is the normalized identifier used for must-linking in resolution.
+    `kind` may be "unknown" when the parser can't decide — that is resolved later,
+    not guessed here.
+    """
+
+    display_name: Optional[str] = None
+    id_type: IdType = "none"
+    id_value: Optional[str] = None
+    raw: str = ""
+    role: ParticipantRole = "member"
+    kind: ParticipantKind = "unknown"
+    descriptors: list[str] = Field(default_factory=list)
+
+
 class SourceItem(BaseModel):
     """One atomic unit of correspondence (an email, a WhatsApp message, a PDF, …).
 
@@ -48,17 +74,39 @@ class SourceItem(BaseModel):
     conversation_id: str = ""  # groups items into a conversation/thread
     timestamp_raw: str = ""
     timestamp: Optional[datetime] = None  # normalized where parseable
-    sender: str = ""
-    recipients: str = ""
+    participants: list[Participant] = Field(default_factory=list)
     subject: Optional[str] = None
     body: str = ""
     notes: str = ""  # ORACLE — not for the pipeline
     provenance: Provenance
     content_hash: str = ""
 
+    @property
+    def senders(self) -> list[Participant]:
+        return [p for p in self.participants if p.role == "sender"]
+
+    @property
+    def addressees(self) -> list[Participant]:
+        return [p for p in self.participants if p.role in ("recipient", "cc")]
+
+    @property
+    def sender_display(self) -> str:
+        """Best human label for the first sender, for the UI and retrieval text."""
+        for p in self.senders:
+            return p.display_name or p.raw or p.id_value or ""
+        return ""
+
+    @property
+    def recipients_display(self) -> str:
+        parts = [p.display_name or p.raw or p.id_value or "" for p in self.addressees]
+        return ", ".join(x for x in parts if x)
+
+    def emails(self) -> list[str]:
+        return [p.id_value for p in self.participants if p.id_type == "email" and p.id_value]
+
     def compute_hash(self) -> str:
         """Exact-duplicate key over normalized body + sender + subject."""
-        norm = _normalize_for_hash(f"{self.sender}\n{self.subject or ''}\n{self.body}")
+        norm = _normalize_for_hash(f"{self.sender_display}\n{self.subject or ''}\n{self.body}")
         return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 

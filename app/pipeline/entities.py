@@ -33,30 +33,25 @@ SUBEVENTS = {
 }
 
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-@]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-_NAME_EMAIL_RE = re.compile(r"\s*\"?([^<>\"]+?)\"?\s*<([^>]+)>")
 _MONEY_RE = re.compile(r"\$\s?([0-9][0-9,]*\.[0-9]{2})")
 
 
 # ----------------------------------------------------------------------------- extraction
 def _people_mentions(items: list[SourceItem]):
-    """(display_name, email, item_id, surface_text) from every header field."""
+    """(display_name, email, item_id, surface_text) from typed person participants.
+
+    Only participants the parser classified as people are considered, so
+    placeholders, group titles, role mailboxes and org issuers never become people.
+    """
     out = []
     for it in items:
-        for field in (it.sender, it.recipients):
-            if not field:
+        for p in it.participants:
+            if p.kind != "person":
                 continue
-            for chunk in field.split(","):
-                chunk = chunk.strip()
-                if not chunk:
-                    continue
-                m = _NAME_EMAIL_RE.match(chunk)
-                if m:
-                    name, email = m.group(1).strip(), m.group(2).strip().lower()
-                elif _EMAIL_RE.fullmatch(chunk):
-                    name, email = "", chunk.lower()
-                else:
-                    name, email = chunk, ""
-                out.append((name, email, it.id, chunk))
+            email = p.id_value if p.id_type == "email" else ""
+            name = p.display_name or (p.id_value if p.id_type == "phone" else "")
+            surface = p.raw or name or email or ""
+            out.append((name or "", email or "", it.id, surface))
     return out
 
 
@@ -170,7 +165,8 @@ def _best_label(names, emails):
 def extract_orgs(items: list[SourceItem], people: list[Entity]) -> list[Entity]:
     org_items: dict[str, set[str]] = defaultdict(set)
     for it in items:
-        for email in _EMAIL_RE.findall(f"{it.sender} {it.recipients} {it.body}"):
+        emails = list(it.emails()) + _EMAIL_RE.findall(it.body)
+        for email in emails:
             domain = email.split("@")[-1].lower()
             for dom, org in DOMAIN_ORG.items():
                 if domain.endswith(dom):

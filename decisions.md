@@ -162,3 +162,42 @@ into the docs. Removing it makes the project self-contained.
 - Dead `reasons` dict in `resolve_people` was written and never read; removed.
 - `scripts/ingest_stats.py` still probed for pre-rebuild pseudonyms that no longer occur
   in the data; removed that block.
+
+## Phase 1 — typed participants and adapters
+
+### D1.1 — Typed `Participant`s instead of header strings
+**Chose:** replace `SourceItem.sender`/`recipients` free-text with
+`participants: list[Participant]`, each carrying `display_name`, `id_type`/`id_value`
+(normalized), `raw`, `role`, `kind`, and `descriptors`. Parsing lives in
+`app/ingest/participants.py`; a read-only `sender_display` serves the UI.
+**Alternatives:** keep the strings and clean them at resolution time.
+**Reasoning:** the old path split header strings on commas and typed every chunk as a
+person, so `—`, group titles and `Org (…, City)` fragments all became people. Typing at
+parse time removed all of them: a fresh heuristic build went from 90 people with 52
+`unknown`/empty and location fragments, to 27 people with **0** unknown and **0**
+location-fragment persons.
+**Cut:** guessing on ambiguous tokens — those become `kind="unknown"` for Phase 4.
+
+### D1.2 — A parenthesis/quote-aware tokenizer; getaddresses for email lists
+**Chose:** split address lists on commas that are not inside `<>`, `()` or quotes, and
+use `email.utils.getaddresses` for `@`-bearing headers. Invisible/bidi marks are
+stripped for matching but kept in `raw`. Document issuers (PDF sender lines) parse to
+one org with the trailing location as a descriptor note.
+**Reasoning:** `"Acme (North Wing, Springfield)"` and `"Doe, Jane" <j@x>` must each stay
+one participant; the naive comma split broke both.
+**Cut:** nothing.
+
+### D1.3 — Phone normalization degrades without the library
+**Chose:** normalize phones to E.164 with `phonenumbers` when installed; otherwise a
+deterministic fallback compacts to `+<country><national>` using a configured region.
+`phonenumbers` is listed in requirements as optional.
+**Alternatives:** hard-require `phonenumbers`.
+**Reasoning:** the package could not be installed in this environment, and the pipeline
+must still run. The fallback normalizes the shapes we see; the library is used when
+present. Recorded here because it is a real limitation, not a silent one.
+**Cut:** validating that a number is dialable when the library is absent.
+
+### Mistakes and what I changed
+- A bare `Mumbai` still appeared as a person after the first pass — it was the trailing
+  location on a PDF issuer line. Fixed by parsing issuers as a single org with the
+  location as a descriptor.

@@ -50,7 +50,7 @@ class ItemExtraction:
 def _fmt_item(it: SourceItem) -> str:
     body = re.sub(r"\s+", " ", it.body)[:800]
     subj = f" | subject: {it.subject}" if it.subject else ""
-    return f"[{it.id}] ({it.source_type.value}) from: {it.sender[:60]}{subj}\n{body}"
+    return f"[{it.id}] ({it.source_type.value}) from: {it.sender_display[:60]}{subj}\n{body}"
 
 
 def _batches(items: list[SourceItem], size: int):

@@ -12,6 +12,7 @@ from typing import Optional
 
 from ..graph_model import Edge, Entity, EntityType, EventGraph, Mention, RelevanceVerdict
 from ..ingest.dedup import DedupResult, find_duplicates
+from ..ingest.participants import mark_shared_mailboxes
 from ..schema import SourceItem
 from . import entities as E
 from .relevance import score_relevance
@@ -29,11 +30,8 @@ class Bundle:
     stats: dict = field(default_factory=dict)
 
 
-def _surface_chunks(field_val: str) -> list[str]:
-    return [c.strip() for c in (field_val or "").split(",") if c.strip()]
-
-
 def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None) -> Bundle:
+    mark_shared_mailboxes(items)  # downgrade addresses used by 3+ names to system
     dedup = find_duplicates(items)
 
     if mode == "llm":
@@ -220,27 +218,22 @@ def _relations(items, people, orgs, locations, money, subevents, documents) -> l
         for em in p.attrs.get("emails", []):
             email2person.setdefault(em.lower(), p.id)
 
-    def resolve_person(text: str):
-        if not text:
+    def resolve_participant(p) -> Optional[str]:
+        if p.kind != "person":
             return None
-        if text in surf2person:
-            return surf2person[text]
-        for em in _EMAIL_RE.findall(text):
-            if em.lower() in email2person:
-                return email2person[em.lower()]
-        return None
+        if p.id_type == "email" and p.id_value and p.id_value in email2person:
+            return email2person[p.id_value]
+        return surf2person.get(p.raw)
 
     # corresponded_with (person <-> person), aggregated
     pair_items: dict[tuple, set] = defaultdict(set)
     for it in items:
-        s = resolve_person(it.sender)
-        if not s:
-            continue
-        for chunk in _surface_chunks(it.recipients):
-            t = resolve_person(chunk)
-            if t and t != s:
-                key = tuple(sorted((s, t)))
-                pair_items[key].add(it.id)
+        senders = [r for r in (resolve_participant(p) for p in it.senders) if r]
+        recipients = [r for r in (resolve_participant(p) for p in it.addressees) if r]
+        for s in senders:
+            for t in recipients:
+                if t != s:
+                    pair_items[tuple(sorted((s, t)))].add(it.id)
     for (a, b), iids in pair_items.items():
         add(a, b, "corresponded_with", iids, weight=float(len(iids)))
 

@@ -41,7 +41,7 @@ def _retrieve(question: str, bundle: Bundle, k: int = 16):
     q = _tokens(question)
     scored = []
     for it in bundle.items:
-        overlap = len(q & _tokens(f"{it.subject or ''} {it.body} {it.sender}"))
+        overlap = len(q & _tokens(f"{it.subject or ''} {it.body} {it.sender_display}"))
         if overlap:
             # small boost for relevant items so noise doesn't dominate
             scored.append((overlap + (1 if it.id in rel else 0), it))
@@ -76,7 +76,7 @@ def query_graph(question: str, bundle: Bundle, client: LLMClient | None = None) 
     def _line(it):
         ts = it.timestamp.isoformat()[:16] if it.timestamp else "n/a"
         body = re.sub(r"\s+", " ", it.body)[:450]
-        return f"[{it.id}] ({it.source_type.value}, {ts}) from {it.sender[:50]}: {body}"
+        return f"[{it.id}] ({it.source_type.value}, {ts}) from {it.sender_display[:50]}: {body}"
 
     item_block = "\n\n".join(_line(it) for it in items)
     user = (

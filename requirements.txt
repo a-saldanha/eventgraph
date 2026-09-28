@@ -6,3 +6,5 @@ pydantic>=2.6
 anthropic>=0.39          # LLM extraction + query (optional; MockLLM used without a key)
 httpx>=0.27              # LlamaParse PDF ingestion (optional)
 python-multipart>=0.0.9  # file uploads (/api/ingest)
+python-dateutil>=2.9     # timezone-abbreviation parsing
+phonenumbers>=8.13       # phone normalization to E.164 (optional; deterministic fallback if absent)
