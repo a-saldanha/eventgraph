@@ -202,6 +202,29 @@ present. Recorded here because it is a real limitation, not a silent one.
   location on a PDF issuer line. Fixed by parsing issuers as a single org with the
   location as a descriptor.
 
+## Phase 2 — identity must-links, owner inference, applied dedup
+
+### D2.1 — Must-link by identifier; infer the owner from structure
+**Chose:** `app/resolve/identity.py` union-links participants sharing a normalized
+email/phone (role/shared mailboxes excluded). `app/resolve/owner.py` picks the owner by
+structural reach — conversations, channels, inbox-recipient count, self rows, and the
+dominant WhatsApp handle — never by name. `OWNER_IDENTIFIERS` is a logged cross-check.
+**Reasoning:** the owner's email identity, leet handle (`A!@n`) and calendar-self marker
+share no identifier, so only structure can unite them. Result: the owner went from three
+entities to one spanning email + calendar + pdf + whatsapp.
+**Cut:** merging different emails of one person here — that is Phase 4's job.
+
+### D2.2 — Apply dedup before extraction
+**Chose:** stamp `SourceItem.duplicate_of` from the dedup canonical map and run
+extraction/relevance/money over canonical items only; copies stay for provenance.
+**Reasoning:** a forwarded invoice is a duplicate, so its amount must count once. The
+dedup result was previously computed but unused.
+**Cut:** nothing.
+
+### Mistakes and what I changed
+- `A!@n` was read as an email (no dotted domain), forging a 1,140-member identity. Emails
+  now require a dotted domain, so leet handles stay handles.
+
 ## Phase 2 — identity, owner, and applied dedup
 
 ### D2.1 — `duplicate_of` on the item, extraction over canonicals only
