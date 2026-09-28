@@ -25,7 +25,7 @@ class Mention(BaseModel):
     """One surface-form occurrence of an entity, grounded to a source item."""
 
     item_id: str
-    text: str  # the surface form as it appeared (e.g. "R0h@n", "rohan.menezes042@…")
+    text: str  # the surface form as it appeared (e.g. "J@ne", "jane.doe042@…")
     span: Optional[tuple[int, int]] = None  # char range in the item body, when known
 
 

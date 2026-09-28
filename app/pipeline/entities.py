@@ -62,7 +62,7 @@ def _people_mentions(items: list[SourceItem], owner_refs: set | None = None):
 
 def _email_stem(email: str) -> str:
     local = email.split("@")[0]
-    return re.sub(r"[^a-z]", "", local.lower())  # drop digits/dots: rohan0707.menezes -> rohanmenezes
+    return re.sub(r"[^a-z]", "", local.lower())  # drop digits/dots: jane0707.doe -> janedoe
 
 
 # ----------------------------------------------------------------------------- resolution
