@@ -222,6 +222,63 @@ JOBS = JobManager(on_bundle=_publish)
 # ── endpoints ──────────────────────────────────────────────────────────────────
 
 
+@app.post("/api/replay")
+async def replay(
+    request: Request,
+    mode: str = Query("heuristic"),
+    session_id: str | None = Cookie(None, alias="eventgraph_session"),
+):
+    """Run the full pipeline on $DATA_DIR/raw/ files as a session-scoped job.
+
+    Model responses are cached in $DATA_DIR/cache/llm — this is fast and free
+    as long as the source files haven't changed since the last build.
+    """
+    raw_dir = DATA_DIR / "raw"
+    if not raw_dir.is_dir():
+        return JSONResponse(
+            status_code=400,
+            content={"error": "no_raw_dir",
+                     "message": "No raw/ directory on this server. Contact the site owner."},
+        )
+
+    native_exts = {".mbox", ".eml", ".txt", ".csv", ".tsv", ".xlsx", ".pdf"}
+    files: list[tuple[str, bytes]] = []
+    for f in sorted(raw_dir.iterdir()):
+        if f.is_file() and f.suffix.lower() in native_exts:
+            files.append((f.name, f.read_bytes()))
+
+    if not files:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "no_files",
+                     "message": "No source files found in DATA_DIR/raw/."},
+        )
+
+    if not session_id:
+        session_id = str(uuid.uuid4())
+
+    job = JOBS.start(files, mode=mode, session_id=session_id)
+    resp = JSONResponse({"job_id": job.id, "n_files": len(files), "source": "replay"})
+    resp.set_cookie(
+        "eventgraph_session", session_id,
+        max_age=1800, samesite="lax", httponly=True,
+    )
+    return resp
+
+
+@app.post("/api/session/reset")
+async def session_reset():
+    """Clear the session cookie so the shared bundle is served again."""
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(
+        "eventgraph_session",
+        path="/",
+        samesite="lax",
+        httponly=True,
+    )
+    return resp
+
+
 @app.get("/api/health")
 def health():
     from .llm.client import llm_available

@@ -52,6 +52,19 @@ export const api = {
     if (!r.ok) throw new Error(`${r.status}`);
     return r.json();
   },
+  replay: async (mode = "heuristic") => {
+    const r = await fetch(`/api/replay?mode=${mode}`, { method: "POST" });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.message || `${r.status}`);
+    }
+    return r.json();
+  },
+  resetSession: async () => {
+    const r = await fetch("/api/session/reset", { method: "POST" });
+    if (!r.ok) throw new Error(`${r.status}`);
+    return r.json();
+  },
 };
 
 // Poll a job until done or failed; calls onEvent for each new event, resolves with final state.

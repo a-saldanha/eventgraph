@@ -2,7 +2,16 @@
 import { useEffect, useRef, useState } from "react";
 import { api, pollJob } from "@/lib/api";
 
-export default function IngestView({ onIngested }) {
+const MAX_BYTES = 4 * 1024 * 1024; // 4 MB — Vercel's request body limit
+
+export default function IngestView({
+  onIngested,
+  onReplay,
+  replayLog,
+  replayBusy,
+  replayError,
+  replayDone,
+}) {
   const [files, setFiles] = useState([]);
   const [drag, setDrag] = useState(false);
   const [log, setLog] = useState([]);
@@ -17,10 +26,23 @@ export default function IngestView({ onIngested }) {
     api.capabilities().then((c) => setLlmAvail(c.llm_available)).catch(() => {});
   }, []);
 
-  const addFiles = (list) => setFiles((prev) => [...prev, ...Array.from(list)]);
+  const addFiles = (list) => {
+    const totalSize = [...files, ...Array.from(list)].reduce((s, f) => s + f.size, 0);
+    if (totalSize > MAX_BYTES) {
+      setError(`Total upload exceeds 4 MB. Please split across requests.`);
+      return;
+    }
+    setError(null);
+    setFiles((prev) => [...prev, ...Array.from(list)]);
+  };
 
   const run = async () => {
     if (!files.length) return;
+    const totalSize = files.reduce((s, f) => s + f.size, 0);
+    if (totalSize > MAX_BYTES) {
+      setError("Total upload exceeds 4 MB. Please remove some files and try again.");
+      return;
+    }
     setBusy(true);
     setLog([]);
     setDoneStats(null);
@@ -41,9 +63,59 @@ export default function IngestView({ onIngested }) {
     }
   };
 
+  const logPanel = (events, label) => (
+    <div style={{ marginTop: 16 }}>
+      <div className="section-h">{label}</div>
+      <div className="mono" style={{
+        background: "#fff", border: "1px solid var(--border)",
+        padding: 10, maxHeight: 320, overflow: "auto",
+      }}>
+        {events.map((e, i) => (
+          <div key={i} style={{
+            color: e.stage === "error" ? "var(--fail, #a12d2d)"
+              : e.stage === "done" ? "#2f855a" : "#333",
+            padding: "1px 0",
+          }}>
+            <span className="meta">[{e.stage}]</span> {e.message}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
   return (
     <div className="pad" style={{ maxWidth: 760 }}>
-      <div className="section-h">Ingest files</div>
+
+      {/* ── Replay section ─────────────────────────────────────────────── */}
+      <div className="section-h">Replay the original archive</div>
+      <p className="snippet">
+        Runs the real pipeline on the original 4 source files already on the server.
+        Model responses are cached, so this takes about a minute and costs nothing.
+      </p>
+      <button
+        className="active"
+        disabled={replayBusy}
+        onClick={() => onReplay && onReplay("heuristic")}
+        style={{ marginBottom: 4 }}
+      >
+        {replayBusy ? "Running replay…" : "Replay the upload"}
+      </button>
+      {(replayLog?.length > 0) && logPanel(replayLog, "Replay progress")}
+      {replayError && (
+        <div className="note" style={{ marginTop: 8, color: "var(--fail, #a12d2d)" }}>
+          {replayError}
+        </div>
+      )}
+      {replayDone && (
+        <div className="note" style={{ marginTop: 8 }}>
+          Replay complete — graph is ready. Switch to Graph or Queries to explore.
+        </div>
+      )}
+
+      <hr style={{ margin: "24px 0", borderColor: "var(--border)" }} />
+
+      {/* ── Upload your own files section ──────────────────────────────── */}
+      <div className="section-h">Upload your own files</div>
       <p className="snippet">
         Supported: WhatsApp <b>.txt</b> exports, <b>.eml</b>, <b>.mbox</b>, <b>.csv</b>, <b>.pdf</b>.
         Upload up to 4 MB total. Files stay in your browser session for 30 minutes and are never stored permanently.
@@ -64,7 +136,7 @@ export default function IngestView({ onIngested }) {
         <strong>Drop files here</strong> or click to browse
         <input
           ref={inputRef} type="file" multiple hidden
-          accept=".md,.txt,.eml,.mbox,.pdf,.xlsx,.csv,.zip"
+          accept=".txt,.eml,.mbox,.csv,.tsv,.pdf,.xlsx"
           onChange={(e) => addFiles(e.target.files)}
         />
       </div>
@@ -77,6 +149,9 @@ export default function IngestView({ onIngested }) {
               {f.name} <span className="meta">({Math.round(f.size / 1024)} KB)</span>
             </div>
           ))}
+          <div style={{ marginTop: 6, fontSize: 12, color: "#888" }}>
+            Total: {(files.reduce((s, f) => s + f.size, 0) / 1024).toFixed(0)} KB / 4096 KB
+          </div>
           <label style={{
             display: "flex", alignItems: "center", gap: 6,
             marginTop: 10, opacity: llmAvail ? 1 : 0.5,
@@ -92,30 +167,12 @@ export default function IngestView({ onIngested }) {
             <button className="active" disabled={busy} onClick={run}>
               {busy ? "Processing…" : `Build graph${useLLM ? " (with model)" : " (instant)"}`}
             </button>
-            <button disabled={busy} onClick={() => setFiles([])}>Clear</button>
+            <button disabled={busy} onClick={() => { setFiles([]); setError(null); }}>Clear</button>
           </div>
         </div>
       )}
 
-      {log.length > 0 && (
-        <div style={{ marginTop: 16 }}>
-          <div className="section-h">Progress</div>
-          <div className="mono" style={{
-            background: "#fff", border: "1px solid var(--border)",
-            padding: 10, maxHeight: 320, overflow: "auto",
-          }}>
-            {log.map((e, i) => (
-              <div key={i} style={{
-                color: e.stage === "error" ? "var(--fail, #a12d2d)"
-                  : e.stage === "done" ? "#2f855a" : "#333",
-                padding: "1px 0",
-              }}>
-                <span className="meta">[{e.stage}]</span> {e.message}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      {log.length > 0 && logPanel(log, "Progress")}
 
       {error && (
         <div className="note" style={{ marginTop: 12, color: "var(--fail, #a12d2d)" }}>
@@ -128,7 +185,7 @@ export default function IngestView({ onIngested }) {
           Graph built from your upload: <b>{doneStats.items}</b> items,{" "}
           {doneStats.exact_dupes + doneStats.near_dupes} duplicates removed,{" "}
           <b>{doneStats.entities}</b> entities, {doneStats.edges} edges,{" "}
-          <b>{doneStats.merges}</b> identity merges. Switch to Graph or Queries to explore.
+          <b>{doneStats.merges}</b> identity merges.
         </div>
       )}
     </div>

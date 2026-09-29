@@ -42,7 +42,7 @@ const ROADMAP = [
   "Multi-event support — each event gets its own graph and session",
 ];
 
-export default function OverviewView({ stats, onGo }) {
+export default function OverviewView({ stats, onGo, onReplay, replayBusy }) {
   const n = (v) => (v == null ? "—" : v.toLocaleString());
   const dupes = stats ? (stats.exact_dupes || 0) + (stats.near_dupes || 0) : null;
 
@@ -73,6 +73,14 @@ export default function OverviewView({ stats, onGo }) {
         <div className="hero-cta">
           <button className="btn-primary" onClick={() => onGo("Graph")}>Explore the graph →</button>
           <button className="btn-ghost" onClick={() => onGo("Queries")}>Ask a question</button>
+          <button
+            className="btn-ghost"
+            disabled={replayBusy}
+            onClick={() => onReplay && onReplay("heuristic")}
+            title="Runs the real pipeline on the 4 original source files. Cached — costs nothing."
+          >
+            {replayBusy ? "Replaying…" : "Replay the upload →"}
+          </button>
         </div>
       </section>
 

@@ -1,6 +1,6 @@
 "use client";
-import { useEffect, useState } from "react";
-import { api } from "@/lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, pollJob } from "@/lib/api";
 import GraphView from "@/components/GraphView";
 import TimelineView from "@/components/TimelineView";
 import CorpusView from "@/components/CorpusView";
@@ -14,15 +14,75 @@ const TABS = ["Overview", "Graph", "Timeline", "Corpus", "Queries", "Resolution"
 export default function Page() {
   const [tab, setTab] = useState("Overview");
   const [stats, setStats] = useState(null);
-  const [selection, setSelection] = useState(null); // {kind:'entity'|'item', id}
+  const [selection, setSelection] = useState(null);
   const [highlight, setHighlight] = useState([]);
   const [reloadKey, setReloadKey] = useState(0);
 
-  const refresh = () => { api.stats().then(setStats).catch(() => {}); setReloadKey((k) => k + 1); };
+  // "shared" = real archive, "replay" = viewer's replay, "upload" = viewer's upload
+  const [dataset, setDataset] = useState("shared");
+  const [hasReplay, setHasReplay] = useState(false);
+  const [hasUpload, setHasUpload] = useState(false);
+
+  // Replay job progress (managed at page level so both Overview and Ingest can share it)
+  const [replayLog, setReplayLog] = useState([]);
+  const [replayBusy, setReplayBusy] = useState(false);
+  const [replayError, setReplayError] = useState(null);
+  const [replayDone, setReplayDone] = useState(false);
+
+  const refresh = () => {
+    api.stats().then(setStats).catch(() => {});
+    setReloadKey((k) => k + 1);
+  };
   useEffect(() => { api.stats().then(setStats).catch(() => {}); }, []);
 
   const selEntity = (id) => setSelection({ kind: "entity", id });
   const selItem = (id) => setSelection({ kind: "item", id });
+
+  const triggerReplay = useCallback(async (mode = "heuristic") => {
+    if (replayBusy) return;
+    setReplayBusy(true);
+    setReplayLog([]);
+    setReplayError(null);
+    setReplayDone(false);
+    setTab("Ingest"); // show live progress
+    try {
+      const { job_id } = await api.replay(mode);
+      const result = await pollJob(job_id, (evt) => setReplayLog((l) => [...l, evt]));
+      if (result.status === "failed") {
+        setReplayError(result.error || "Replay failed.");
+      } else {
+        setHasReplay(true);
+        setDataset("replay");
+        setReplayDone(true);
+        refresh();
+        setTab("Graph");
+      }
+    } catch (e) {
+      setReplayError(String(e));
+    } finally {
+      setReplayBusy(false);
+    }
+  }, [replayBusy]);
+
+  const switchDataset = useCallback(async (target) => {
+    if (target === dataset) return;
+    if (target === "shared") {
+      try { await api.resetSession(); } catch {}
+      setDataset("shared");
+      refresh();
+    } else {
+      // replay/upload — session bundle already set; just switch label + refresh
+      setDataset(target);
+      refresh();
+    }
+  }, [dataset]);
+
+  const handleIngested = useCallback(() => {
+    setHasUpload(true);
+    setDataset("upload");
+    refresh();
+    setTab("Graph");
+  }, []);
 
   return (
     <div className="app">
@@ -34,6 +94,30 @@ export default function Page() {
           ))}
         </div>
         <span className="spacer" />
+
+        {/* Dataset switcher */}
+        {(hasReplay || hasUpload) && (
+          <div className="dataset-switcher">
+            <button
+              className={dataset === "shared" ? "active" : ""}
+              onClick={() => switchDataset("shared")}
+              title="The original prebuilt archive"
+            >Real archive</button>
+            {hasReplay && (
+              <button
+                className={dataset === "replay" ? "active" : ""}
+                onClick={() => switchDataset("replay")}
+              >Your replay</button>
+            )}
+            {hasUpload && (
+              <button
+                className={dataset === "upload" ? "active" : ""}
+                onClick={() => switchDataset("upload")}
+              >Your upload</button>
+            )}
+          </div>
+        )}
+
         {stats && (
           <span className="stat">
             {stats.items} items → {stats.relevant_items} relevant · {stats.exact_dupes + stats.near_dupes} dupes ·
@@ -44,8 +128,24 @@ export default function Page() {
 
       <div className="main">
         <div className="content" key={reloadKey}>
-          {tab === "Overview" && <OverviewView stats={stats} onGo={setTab} />}
-          {tab === "Ingest" && <IngestView onIngested={() => { refresh(); setTab("Graph"); }} />}
+          {tab === "Overview" && (
+            <OverviewView
+              stats={stats}
+              onGo={setTab}
+              onReplay={triggerReplay}
+              replayBusy={replayBusy}
+            />
+          )}
+          {tab === "Ingest" && (
+            <IngestView
+              onIngested={handleIngested}
+              onReplay={triggerReplay}
+              replayLog={replayLog}
+              replayBusy={replayBusy}
+              replayError={replayError}
+              replayDone={replayDone}
+            />
+          )}
           {tab === "Graph" && <GraphView onSelectEntity={selEntity} highlight={highlight} />}
           {tab === "Timeline" && <TimelineView onSelectEntity={selEntity} />}
           {tab === "Corpus" && <CorpusView onSelectItem={selItem} />}

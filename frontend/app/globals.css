@@ -20,6 +20,10 @@ input, select { font: inherit; border: 1px solid var(--border-strong); padding: 
 .top .tabs { display: flex; gap: 4px; }
 .top .stat { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 .top .spacer { flex: 1; }
+.dataset-switcher { display: flex; gap: 3px; border: 1px solid var(--border-strong);
+  border-radius: 3px; overflow: hidden; }
+.dataset-switcher button { border: none; border-radius: 0; padding: 3px 9px; font-size: 11px; }
+.dataset-switcher button.active { background: var(--text); color: #fff; }
 .main { flex: 1; min-height: 0; display: flex; }
 .content { flex: 1; min-width: 0; position: relative; overflow: auto; }
 .drawer { width: 380px; flex: 0 0 380px; border-left: 1px solid var(--border);
