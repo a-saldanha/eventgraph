@@ -1,11 +1,11 @@
 """Orchestrate the pipeline into an EventGraph, and derive relations + timeline.
 
-parse (done upstream) → dedup → extract entities → resolve people →
-relations → timeline. Heuristic today, interfaces ready for LLM swap-in.
+parse → dedup → extract entities → resolve people →
+relations → timeline → contract validation.
 """
 from __future__ import annotations
 
-import difflib
+import hashlib
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -14,6 +14,7 @@ from typing import Optional
 from ..graph_model import Edge, Entity, EntityType, EventGraph, Mention, MergeRecord, RelevanceVerdict
 from ..ingest.dedup import DedupResult, find_duplicates
 from ..ingest.participants import mark_shared_mailboxes
+from ..ingest.report import IngestReport
 from ..schema import SourceItem
 from . import entities as E
 
@@ -35,24 +36,89 @@ class Bundle:
     stats: dict = field(default_factory=dict)
     review_queue: list[dict] = field(default_factory=list)
     item_topics: dict = field(default_factory=dict)
+    ingest_report: Optional[IngestReport] = None
+
+
+def _stable_id(entity_type: str, key: str) -> str:
+    """Deterministic entity ID from type + content key.
+
+    Same type + same key always produces the same ID across rebuilds.
+    On a SHA-1 prefix collision (extremely unlikely at this scale),
+    the caller appends a numeric suffix.
+    """
+    h = hashlib.sha1(key.encode("utf-8", errors="replace")).hexdigest()[:10]
+    return f"{entity_type}:{h}"
+
+
+def _assign_stable_ids(entities: list[Entity]) -> dict[str, str]:
+    """Replace sequential IDs with content-derived IDs. Return old→new map."""
+    old_to_new: dict[str, str] = {}
+    used: dict[str, int] = {}  # new_id -> collision counter
+
+    for e in entities:
+        if e.type == EntityType.PERSON:
+            emails = sorted(e.attrs.get("emails", []))
+            if emails:
+                key = "emails:" + ",".join(emails)
+            else:
+                # No hard identifier — use sorted aliases + first mention item
+                first_item = sorted(e.item_ids)[0] if e.item_ids else ""
+                key = "name:" + _norm_key(e.label) + ":" + first_item
+        elif e.type == EntityType.MONEY:
+            key = f"amount:{e.attrs.get('amount', 0)}"
+        else:
+            key = _norm_key(e.label)
+
+        candidate = _stable_id(e.type.value, key)
+        if candidate in used:
+            used[candidate] += 1
+            candidate = f"{candidate}_{used[candidate]}"
+        else:
+            used[candidate] = 0
+
+        old_to_new[e.id] = candidate
+        e.id = candidate
+
+    return old_to_new
+
+
+def _norm_key(label: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", (label or "").lower())).strip()
+
+
+def _remap(old_to_new: dict[str, str], entities: list[Entity],
+           edges: list[Edge], merges: list[MergeRecord],
+           review_queue: list[dict]) -> None:
+    """Remap all ID references in-place through old_to_new."""
+    # Entity IDs already updated by _assign_stable_ids.
+    # Update edge endpoints.
+    for ed in edges:
+        ed.source = old_to_new.get(ed.source, ed.source)
+        ed.target = old_to_new.get(ed.target, ed.target)
+    # Update merge records.
+    for mr in merges:
+        mr.canonical_id = old_to_new.get(mr.canonical_id, mr.canonical_id)
+    # Update review queue entity references.
+    for rq in review_queue:
+        for k in ("entity_id", "canonical_id"):
+            if k in rq and rq[k] in old_to_new:
+                rq[k] = old_to_new[rq[k]]
 
 
 def _all_relevant(items):
-    """Mark all items as relevant (relevance is now a query-time concern)."""
     return [RelevanceVerdict(item_id=it.id, relevant=True, score=1.0,
                               rationale="all items included") for it in items]
 
 
 def _consolidate_topics(all_topics: list[str]) -> dict[str, str]:
-    """Map each raw topic label to its canonical (normalized, deduplicated) form."""
+    import difflib
     norm: dict[str, str] = {}
     canonical_groups: list[tuple[str, set]] = []
     for t in sorted(set(all_topics)):
         tn = re.sub(r'[^a-z0-9 ]', '', t.lower().strip())
-        for i, (canon, variants) in enumerate(canonical_groups):
+        for canon, variants in canonical_groups:
             canon_n = re.sub(r'[^a-z0-9 ]', '', canon.lower().strip())
-            ratio = difflib.SequenceMatcher(None, tn, canon_n).ratio()
-            if ratio >= 0.85:
+            if difflib.SequenceMatcher(None, tn, canon_n).ratio() >= 0.85:
                 variants.add(t)
                 norm[t] = canon
                 break
@@ -62,8 +128,15 @@ def _consolidate_topics(all_topics: list[str]) -> dict[str, str]:
     return norm
 
 
-def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None) -> Bundle:
-    mark_shared_mailboxes(items)  # downgrade addresses used by 3+ names to system
+def build_graph(
+    items: list[SourceItem],
+    mode: str = "heuristic",
+    progress=None,
+    ingest_report: Optional[IngestReport] = None,
+) -> Bundle:
+    from ..graph_contract import repair as contract_repair
+
+    mark_shared_mailboxes(items)
     dedup = find_duplicates(items)
     _mark_duplicates(items, dedup)
     canon_items = [it for it in items if not it.duplicate_of]
@@ -75,9 +148,8 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
     else:
         relevance, llm_extractions = _all_relevant(canon_items), None
 
-    # All canonical items go through extraction — relevance is query-time only
     rel_items = canon_items
-    relevant_ids = {v.item_id for v in relevance if v.relevant}  # for stats
+    relevant_ids = {v.item_id for v in relevance if v.relevant}
 
     from ..resolve.identity import build_identity_index
     from ..resolve.owner import infer_owner
@@ -101,7 +173,7 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
             identifier_only=True,
         )
         all_merges.extend(merges)
-        orgs = _domain_orgs_heuristic(people, start_index=0)
+        orgs = _domain_orgs_heuristic(people)
         locations = []
         money = E.extract_money(rel_items)
         resolve_label = "heuristic (identifier merges + structural relations)"
@@ -112,101 +184,194 @@ def build_graph(items: list[SourceItem], mode: str = "heuristic", progress=None)
     all_entities = people + orgs + locations + money + subevents + documents
     edges = _relations(rel_items, people, orgs, locations, money, subevents, documents)
 
-    # In LLM mode, also wire in the LLM-derived relation edges.
     if mode == "llm" and llm_extractions is not None:
         _renumber_edges(llm_edges, start=len(edges))
         edges = edges + llm_edges
 
-    # Deterministic post-merge: collapse entities that share a normalized name, so
-    # e.g. 23 separate "Srinivasa" WhatsApp mentions become one person and duplicate
-    # org/location surfaces merge. Edges are remapped and de-duplicated onto the
-    # canonical entity. This restores name-based merging the LLM path alone misses.
-    all_entities, edges = _collapse_by_name(all_entities, edges)
+    # Conservative name merge: replaces the old unconditional _collapse_by_name.
+    all_entities, edges, name_merges = _conservative_name_merge(all_entities, edges)
+    all_merges.extend(name_merges)
+
     _renumber_edges(edges, start=0)
 
+    # Assign stable, content-derived IDs and remap everything.
+    old_to_new = _assign_stable_ids(all_entities)
+    _remap(old_to_new, all_entities, edges, all_merges, review_queue)
+
     graph = EventGraph(entities=all_entities, edges=edges, merges=all_merges, relevance=relevance)
+
+    # Contract validation: repair silently and record what was fixed.
+    _, contract_report = contract_repair(
+        type("_B", (), {"graph": graph, "items": items, "stats": {}, "review_queue": review_queue})()
+    )
+
     timeline = _timeline(subevents, items)
     n_people = sum(1 for e in all_entities if e.type == EntityType.PERSON)
     stats = {
         "items": len(items), "canonical_items": len(canon_items),
         "relevant_items": len(relevant_ids),
         "exact_dupes": dedup.n_exact_dupes, "near_dupes": dedup.n_near_dupes,
-        "entities": len(all_entities), "edges": len(edges),
+        "entities": len(graph.entities), "edges": len(graph.edges),
         "people": n_people, "merges": len(all_merges), "mode": mode,
         "owner": owner.label, "owner_confident": owner.confident,
         "resolve_label": resolve_label,
         "review_queue": len(review_queue),
+        "contract_repairs": len(contract_report.repairs),
     }
     return Bundle(items=items, dedup=dedup, graph=graph, timeline=timeline, stats=stats,
-                  review_queue=review_queue, item_topics=item_topics)
+                  review_queue=review_queue, item_topics=item_topics,
+                  ingest_report=ingest_report)
 
 
-def _norm_name(label: str, etype) -> str:
-    """Normalized merge key. People are order-insensitive and alpha-only so
-    'Menezes Rohan' == 'Rohan Menezes' and 'Srinivasa' variants collapse; orgs and
-    locations keep word order (punctuation/case stripped)."""
-    s = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", (label or "").lower())).strip()
-    if etype == EntityType.PERSON:
-        toks = sorted(t for t in re.sub(r"[^a-z ]", " ", s).split() if len(t) > 1)
-        return " ".join(toks)
-    return s
+# ── conservative name merge (replaces _collapse_by_name) ─────────────────────
+
+_ROLE_LOCAL_PARTS = frozenset({
+    "noreply", "no-reply", "donotreply", "do-not-reply", "notifications",
+    "support", "help", "info", "contact", "team", "hello", "hi",
+    "admin", "postmaster", "mailer-daemon", "listserv", "bounce",
+    "newsletter", "updates", "alerts", "news", "sales", "marketing",
+})
 
 
-def _collapse_by_name(entities: list[Entity], edges: list[Edge]):
-    """Merge same-type entities that share a normalized name; remap + dedup edges."""
+def _is_group_or_system(e: Entity) -> bool:
+    if e.type != EntityType.PERSON:
+        return False
+    for em in e.attrs.get("emails", []):
+        local = em.split("@")[0].lower().replace(".", "").replace("+", "")
+        if local in _ROLE_LOCAL_PARTS:
+            return True
+    return False
+
+
+def _norm_name(label: str) -> str:
+    """Order-insensitive, alpha-only key for full-name comparison."""
+    tokens = sorted(
+        t for t in re.sub(r"[^a-z ]", " ", label.lower()).split()
+        if len(t) > 1
+    )
+    return " ".join(tokens)
+
+
+def _conservative_name_merge(
+    entities: list[Entity], edges: list[Edge]
+) -> tuple[list[Entity], list[Edge], list[MergeRecord]]:
+    """Merge same-type entities by full name only when safe.
+
+    Rules (all must hold):
+    - Both labels have 2 or more tokens after normalisation.
+    - The normalised, order-insensitive forms are equal (people) or identical (others).
+    - Neither entity has conflicting hard identifiers (different emails at different domains).
+    - Neither is a group mailbox or system sender.
+    """
+    # Group by (type, norm_name).
     groups: dict[tuple, list[Entity]] = defaultdict(list)
     for e in entities:
-        groups[(e.type, _norm_name(e.label, e.type))].append(e)
+        if e.type == EntityType.PERSON:
+            norm = _norm_name(e.label)
+        else:
+            norm = _norm_key(e.label)
+        groups[(e.type, norm)].append(e)
 
     remap: dict[str, str] = {}
     merged: list[Entity] = []
+    new_merges: list[MergeRecord] = []
+
     for (etype, norm), group in groups.items():
-        if not norm or len(group) == 1:
+        # Need at least 2 tokens to qualify.
+        if not norm or len(norm.split()) < 2 or len(group) == 1:
             merged.extend(group)
             continue
+
+        # Skip groups containing any group/system entity.
+        if any(_is_group_or_system(e) for e in group):
+            merged.extend(group)
+            continue
+
+        # Check for conflicting hard identifiers.
+        def domain(em: str) -> str:
+            return em.split("@")[-1].lower() if "@" in em else ""
+
+        all_emails: list[set[str]] = [set(e.attrs.get("emails", [])) for e in group]
+        domains: list[set[str]] = [{domain(em) for em in em_set if em} for em_set in all_emails]
+        conflict = False
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                shared_domains = domains[i] & domains[j]
+                ei_only = all_emails[i] - all_emails[j]
+                ej_only = all_emails[j] - all_emails[i]
+                # Conflict: both have emails at the same domain that don't overlap.
+                for dom in shared_domains:
+                    ei_dom = {e for e in ei_only if domain(e) == dom}
+                    ej_dom = {e for e in ej_only if domain(e) == dom}
+                    if ei_dom and ej_dom:
+                        conflict = True
+                        break
+                if conflict:
+                    break
+            if conflict:
+                break
+
+        if conflict:
+            merged.extend(group)
+            continue
+
+        # Safe to merge. Canon = entity with most mentions.
         canon = max(group, key=lambda e: (len(e.mentions), len(e.label)))
-        seen = {(m.item_id, m.text) for m in canon.mentions}
+        seen_mentions = {(m.item_id, m.text) for m in canon.mentions}
+        surfaces = set(canon.aliases) | {canon.label}
+
         for e in group:
             if e is canon:
                 continue
             remap[e.id] = canon.id
             for m in e.mentions:
-                if (m.item_id, m.text) not in seen:
+                if (m.item_id, m.text) not in seen_mentions:
                     canon.mentions.append(m)
-                    seen.add((m.item_id, m.text))
-            canon.aliases = sorted(set(canon.aliases) | set(e.aliases) | {e.label})
+                    seen_mentions.add((m.item_id, m.text))
+            surfaces |= set(e.aliases) | {e.label}
             emails = set(canon.attrs.get("emails", [])) | set(e.attrs.get("emails", []))
             if emails:
                 canon.attrs["emails"] = sorted(emails)
+            # Preserve owner flag.
+            if e.attrs.get("owner"):
+                canon.attrs["owner"] = True
+
+        canon.aliases = sorted(surfaces - {canon.label})
         merged.append(canon)
 
-    by_key: dict[tuple, Edge] = {}
-    out: list[Edge] = []
+        if len(group) > 1:
+            new_merges.append(MergeRecord(
+                canonical_id=canon.id,
+                merged_forms=sorted(surfaces)[:12],
+                rationale="same full name, no conflicting identifiers",
+            ))
+
+    # Remap edge endpoints.
+    edge_keys: dict[tuple, Edge] = {}
+    out_edges: list[Edge] = []
     for ed in edges:
-        s, t = remap.get(ed.source, ed.source), remap.get(ed.target, ed.target)
+        s = remap.get(ed.source, ed.source)
+        t = remap.get(ed.target, ed.target)
         if s == t:
             continue
         key = (s, t, ed.kind)
-        if key in by_key:
-            ex = by_key[key]
+        if key in edge_keys:
+            ex = edge_keys[key]
             ex.weight += ed.weight
-            ex.evidence_item_ids = sorted(set(ex.evidence_item_ids) | set(ed.evidence_item_ids))[:20]
+            ex.evidence_item_ids = sorted(
+                set(ex.evidence_item_ids) | set(ed.evidence_item_ids)
+            )[:20]
         else:
             ed.source, ed.target = s, t
-            by_key[key] = ed
-            out.append(ed)
-    return merged, out
+            edge_keys[key] = ed
+            out_edges.append(ed)
+
+    return merged, out_edges, new_merges
 
 
-def _mark_duplicates(items: list[SourceItem], dedup: DedupResult) -> None:
-    for it in items:
-        canon = dedup.canonical.get(it.id)
-        it.duplicate_of = canon if (canon and canon != it.id) else None
+# ── LLM stage ─────────────────────────────────────────────────────────────────
 
-
-# --------------------------------------------------------------------------- LLM stage
 def _llm_stage(items, progress):
-    """Run LLM extraction, return (relevance verdicts, chunk extractions, item_topics)."""
     from ..llm.extract import extract_chunks
 
     def _p(done, total):
@@ -215,29 +380,23 @@ def _llm_stage(items, progress):
 
     extractions = extract_chunks(items, progress=_p)
 
-    # Collect all topics across all items
     item_topics_raw: dict[str, list[str]] = {}
     for ce in extractions:
         for mt in ce.messages:
             item_topics_raw.setdefault(mt.real_item_id, []).extend(mt.topics)
 
-    # Consolidate near-identical topic labels
     all_topic_labels = [t for topics in item_topics_raw.values() for t in topics]
     topic_map = _consolidate_topics(all_topic_labels) if all_topic_labels else {}
 
-    # Apply consolidation
     item_topics: dict[str, list[str]] = {}
     for iid, topics in item_topics_raw.items():
-        consolidated = list(dict.fromkeys(topic_map.get(t, t) for t in topics))
-        item_topics[iid] = consolidated
+        item_topics[iid] = list(dict.fromkeys(topic_map.get(t, t) for t in topics))
 
     relevance = []
     for it in items:
         topics = item_topics.get(it.id, [])
-        # All items are included; topics stored for query-time scoping
         relevance.append(RelevanceVerdict(
-            item_id=it.id,
-            relevant=True,
+            item_id=it.id, relevant=True,
             score=1.0 if topics else 0.5,
             rationale=", ".join(topics[:3]) if topics else "no topics assigned",
             topics=topics,
@@ -259,12 +418,9 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
     id_profiles = build_profiles_from_identity_clusters(identity.clusters, items_by_id)
     person_bundle = resolve_profiles(id_profiles, "person")
 
-    # FIX 1: actually USE ext_profiles — run person extraction profiles through
-    # blocking + LLM resolution so WhatsApp/name surface variants collapse.
     all_ext_profiles = build_profiles_from_extractions(extractions, items_by_id)
     ext_profiles = [p for p in all_ext_profiles if p.type == "person"]
 
-    # Start with heuristic people (identifier merges + owner unification).
     people, base_merges = E.resolve_people(
         rel_items, owner_refs=set(owner.refs), owner_label=owner.label,
         identifier_only=True,
@@ -273,16 +429,16 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
     all_merges: list[MergeRecord] = list(base_merges) + list(person_bundle.merges)
     review_queue: list[dict] = list(person_bundle.review_queue)
 
-    # Run ext_profiles through LLM resolution and apply resulting merges to
-    # the heuristic people entities.
     if ext_profiles:
         ext_person_bundle = resolve_profiles(ext_profiles, "person")
         all_merges.extend(ext_person_bundle.merges)
         review_queue.extend(ext_person_bundle.review_queue)
-        people = _apply_profile_merges_to_people(
+        people, merge_remap = _apply_profile_merges_to_people(
             people, ext_profiles, ext_person_bundle.merged_groups,
             owner_label=owner.label,
         )
+        # Remap edges that referenced now-merged entity IDs.
+        # (llm_edges built later; remap happens at the call site)
 
     org_profiles = [p for p in all_ext_profiles if p.type == "org"]
     if org_profiles:
@@ -292,9 +448,7 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
         orgs = _profiles_to_entities(org_profiles, org_bundle.merged_groups, EntityType.ORG, "org")
     else:
         orgs = []
-    # Always add domain-derived orgs: they carry member_person_ids, which drive the
-    # person->org affiliated_with edges. Duplicate labels merge in _collapse_by_name.
-    orgs = orgs + _domain_orgs_heuristic(people, start_index=len(orgs))
+    orgs = orgs + _domain_orgs_heuristic(people)
 
     loc_profiles = [p for p in all_ext_profiles if p.type == "location"]
     if loc_profiles:
@@ -308,16 +462,9 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
 
     money = _money_from_llm(extractions, rel_items)
 
-    # FIX 2: build (conv_id, local_entity) -> canonical entity id map and
-    # wire LLM-extracted relations into graph edges.
-    # Build profile_id -> canonical entity id for all entity types.
     key_to_profile_id = build_conv_local_to_profile_map(extractions)
 
-    # profile_id -> entity_id: for people, we need surface matching; for
-    # orgs/locations we use the merged_groups from their bundles.
     profile_id_to_entity_id: dict[str, str] = {}
-
-    # People: match by shared surface/email
     _people_surface_to_eid = {}
     _people_email_to_eid = {}
     for p in people:
@@ -340,12 +487,10 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
         if eid:
             profile_id_to_entity_id[ep.id] = eid
 
-    # Orgs
     if org_profiles and org_bundle:  # type: ignore[possibly-undefined]
         org_ents = {e.id: e for e in orgs}
         for op in org_profiles:
             root = _find_root(op.id, org_bundle.merged_groups)
-            # Find the entity whose label matches root's canonical surface
             for eid, ent in org_ents.items():
                 op_root_profile = next((p for p in org_profiles if p.id == root), None)
                 if op_root_profile and (
@@ -356,7 +501,6 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
                     profile_id_to_entity_id[op.id] = eid
                     break
 
-    # Locations
     if loc_profiles and loc_bundle:  # type: ignore[possibly-undefined]
         loc_ents = {e.id: e for e in locations}
         for lp in loc_profiles:
@@ -370,7 +514,6 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
                         profile_id_to_entity_id[lp.id] = eid
                         break
 
-    # participant_id -> person entity id (for participant-anchored mentions)
     participant_to_entity: dict[str, str] = {}
     for it in rel_items:
         for p in it.participants:
@@ -384,23 +527,18 @@ def _llm_resolve_stage(rel_items, extractions, owner, identity):
                     participant_to_entity.setdefault(p.id_value, eid)
                     participant_to_entity.setdefault(p.raw, eid)
 
-    # Build (conv_id, local_entity) -> entity_id resolver
     def resolve_local(conv_id: str, local_entity: str) -> Optional[str]:
         pid = key_to_profile_id.get((conv_id, local_entity))
         if pid:
             return profile_id_to_entity_id.get(pid)
         return None
 
-    # Collect LLM relation edges (from extractions + derived_relations).
-    llm_edges = _relations_from_llm(
-        extractions, resolve_local, participant_to_entity,
-    )
+    llm_edges = _relations_from_llm(extractions, resolve_local, participant_to_entity)
 
     return people, orgs, locations, money, all_merges, review_queue, llm_edges
 
 
 def _find_root(pid: str, merged_groups: dict[str, set]) -> str:
-    """Return the root profile id for a given pid in merged_groups."""
     for root, members in merged_groups.items():
         if pid in members:
             return root
@@ -412,18 +550,17 @@ def _apply_profile_merges_to_people(
     ext_profiles,
     merged_groups: dict[str, set],
     owner_label: str | None = None,
-) -> list[Entity]:
+) -> tuple[list[Entity], dict[str, str]]:
     """Merge heuristic person entities based on LLM profile resolution.
 
-    For each merged group of profiles, collect the person entities that match
-    any profile in the group (by surface or email), then union-find those
-    entities into one canonical entity.  The owner entity is always preserved
-    as the single owner.
+    Returns (merged_people, old_id_to_canonical_id).
+    The canonical ID of a cluster is the existing entity ID of the member with
+    the most mentions — never a new counter-based ID, so no collision with
+    singletons is possible.
     """
     if not people or not merged_groups:
-        return people
+        return people, {}
 
-    # Build surface/email -> person entity id maps
     surf_to_eid: dict[str, str] = {}
     email_to_eid: dict[str, str] = {}
     for p in people:
@@ -432,9 +569,7 @@ def _apply_profile_merges_to_people(
         for em in p.attrs.get("emails", []):
             email_to_eid.setdefault(em.lower(), p.id)
 
-    # profile_id -> entity_id match
     prof_to_eid: dict[str, str] = {}
-    prof_by_id = {ep.id: ep for ep in ext_profiles}
     for ep in ext_profiles:
         eid = None
         for ident in ep.identifiers:
@@ -449,70 +584,77 @@ def _apply_profile_merges_to_people(
         if eid:
             prof_to_eid[ep.id] = eid
 
-    # For each merged group, union the matched entity ids
     all_eids = [p.id for p in people]
     uf = _UF_local(all_eids)
 
     for root, members in merged_groups.items():
         if len(members) <= 1:
             continue
-        # Collect the entity ids for all profiles in this group
         group_eids = [prof_to_eid[mid] for mid in members if mid in prof_to_eid]
         if len(group_eids) < 2:
             continue
         for j in group_eids[1:]:
             uf.union(group_eids[0], j)
 
-    # Build new canonical entities from union-find clusters
+    # Build clusters keyed by UF root (an actual entity ID, never a new counter).
     clusters: dict[str, list[str]] = defaultdict(list)
     for eid in all_eids:
         clusters[uf.find(eid)].append(eid)
 
     entities_by_id = {p.id: p for p in people}
+    old_to_new: dict[str, str] = {}
     new_people: list[Entity] = []
-    k = 0
+
     for root, members in clusters.items():
         if len(members) == 1:
             new_people.append(entities_by_id[root])
             continue
-        # Merge: combine aliases, emails, mentions; keep owner attrs
-        is_owner = any(entities_by_id[m].attrs.get("owner") for m in members)
-        all_aliases: list[str] = []
-        all_emails: set[str] = set()
-        all_mentions: list[Mention] = []
-        for mid in members:
-            ent = entities_by_id[mid]
-            all_aliases.extend(ent.aliases)
-            all_emails.update(ent.attrs.get("emails", []))
-            all_mentions.extend(ent.mentions)
-        all_aliases = sorted(set(all_aliases))
-        # Choose label: owner_label if owner, else longest alias
-        if is_owner and owner_label:
-            label = owner_label
-        else:
-            real = [a for a in all_aliases if "@" not in a and len(a) > 1]
-            label = max(real, key=lambda n: (len(n.split()), len(n))) if real else (
-                sorted(all_emails)[0] if all_emails else all_aliases[0] if all_aliases else "unknown"
-            )
-        attrs: dict = {"emails": sorted(all_emails)}
-        if is_owner:
-            attrs["owner"] = True
-        new_people.append(Entity(
-            id=f"person:{k}", type=EntityType.PERSON, label=label,
-            aliases=all_aliases, mentions=all_mentions, attrs=attrs,
-        ))
-        k += 1
 
-    # Re-number singletons that weren't merged
-    result: list[Entity] = []
-    for ent in new_people:
-        if ent.id.startswith("person:") and not any(e.id == ent.id for e in result):
-            result.append(ent)
-    return result
+        # Choose the canonical entity: prefer the owner, then most mentions.
+        is_owner = any(entities_by_id[m].attrs.get("owner") for m in members)
+        owner_members = [m for m in members if entities_by_id[m].attrs.get("owner")]
+        if owner_members:
+            canon_id = owner_members[0]
+        else:
+            canon_id = max(members, key=lambda m: len(entities_by_id[m].mentions))
+
+        canon = entities_by_id[canon_id]
+
+        # Map all non-canonical members to the canonical ID.
+        for mid in members:
+            if mid != canon_id:
+                old_to_new[mid] = canon_id
+
+        # Merge non-canonical members into canon.
+        seen = {(m.item_id, m.text) for m in canon.mentions}
+        all_emails: set[str] = set(canon.attrs.get("emails", []))
+        surfaces = set(canon.aliases) | {canon.label}
+
+        for mid in members:
+            if mid == canon_id:
+                continue
+            ent = entities_by_id[mid]
+            for m in ent.mentions:
+                if (m.item_id, m.text) not in seen:
+                    canon.mentions.append(m)
+                    seen.add((m.item_id, m.text))
+            all_emails.update(ent.attrs.get("emails", []))
+            surfaces |= set(ent.aliases) | {ent.label}
+            if ent.attrs.get("owner"):
+                canon.attrs["owner"] = True
+
+        canon.attrs["emails"] = sorted(all_emails)
+        canon.aliases = sorted(surfaces - {canon.label})
+
+        if is_owner and owner_label:
+            canon.label = owner_label
+
+        new_people.append(canon)
+
+    return new_people, old_to_new
 
 
 class _UF_local:
-    """Local union-find for entity merging."""
     def __init__(self, keys):
         self.p = {k: k for k in keys}
 
@@ -529,35 +671,24 @@ class _UF_local:
 
 
 def _renumber_edges(edges: list[Edge], start: int) -> None:
-    """Renumber edges in-place starting from `start`."""
     for i, edge in enumerate(edges):
         edge.id = f"e{start + i}"
 
 
-def _relations_from_llm(
-    extractions,
-    resolve_local,
-    participant_to_entity: dict[str, str],
-) -> list[Edge]:
-    """Build Edge objects from LLM-extracted relations and derived_relations.
-
-    `resolve_local(conv_id, local_entity)` -> entity_id or None.
-    Skips relations where either endpoint fails to resolve.
-    """
+def _relations_from_llm(extractions, resolve_local, participant_to_entity) -> list[Edge]:
     edges: list[Edge] = []
-    seen: set[tuple] = set()  # deduplicate (src, tgt, kind)
     eid = [0]
 
     def add_edge(src: str, tgt: str, kind: str, item_id: str):
-        key = (src, tgt, kind)
         if src == tgt:
             return
         evidence = [item_id] if item_id else []
-        # Accumulate evidence for duplicate (src, tgt, kind) pairs
         for e in edges:
             if e.source == src and e.target == tgt and e.kind == kind:
                 if item_id and item_id not in e.evidence_item_ids:
-                    e.evidence_item_ids = sorted(set(e.evidence_item_ids) | {item_id})[:20]
+                    e.evidence_item_ids = sorted(
+                        set(e.evidence_item_ids) | {item_id}
+                    )[:20]
                 return
         edges.append(Edge(
             id=f"llm_e{eid[0]}", source=src, target=tgt, kind=kind,
@@ -565,7 +696,6 @@ def _relations_from_llm(
         ))
         eid[0] += 1
 
-    # From extraction relations
     for ce in extractions:
         conv_id = ce.conversation_id
         for rel in ce.relations:
@@ -574,11 +704,6 @@ def _relations_from_llm(
             if not subj_eid or not obj_eid:
                 continue
             add_edge(subj_eid, obj_eid, rel.type, rel.real_item_id)
-
-    # From resolve-derived relations (derived_relations come from profile resolution,
-    # they use profile_ids as subject/object — skip if they don't map to entities)
-    # These are already handled above via profile_id_to_entity_id in the caller.
-    # Here we just process extraction relations.
 
     return edges
 
@@ -613,7 +738,7 @@ def _profiles_to_entities(profiles, merged_groups: dict, etype: EntityType, pref
     return ents
 
 
-def _domain_orgs_heuristic(people, start_index=0) -> list[Entity]:
+def _domain_orgs_heuristic(people: list[Entity]) -> list[Entity]:
     by_domain: dict[str, set] = defaultdict(set)
     dom_items: dict[str, set] = defaultdict(set)
     for p in people:
@@ -636,7 +761,6 @@ def _domain_orgs_heuristic(people, start_index=0) -> list[Entity]:
 
 
 def _money_from_llm(extractions, items) -> list[Entity]:
-    from collections import defaultdict
     from . import currency as C
 
     amt_items: dict[float, set] = defaultdict(set)
@@ -665,16 +789,11 @@ def _money_from_llm(extractions, items) -> list[Entity]:
 def _extract_documents(items: list[SourceItem]) -> list[Entity]:
     docs = []
     for k, it in enumerate(i for i in items if i.source_type.value == "pdf"):
-        label = (it.subject or "document").replace(".pdf", "")
-        low = it.body.lower()
-        for cue, name in (("receipt", "Registration Receipt"), ("invoice", "Invoice"),
-                          ("certificate", "Certificate of Attendance"), ("boarding", "Boarding Pass"),
-                          ("visa", "Visa Letter"), ("itinerary", "Flight Itinerary")):
-            if cue in low:
-                label = name
-                break
-        docs.append(Entity(id=f"doc:{k}", type=EntityType.DOCUMENT, label=label,
-                          mentions=[E.Mention(item_id=it.id, text=label)]))
+        label = (it.subject or it.channel or "document").replace(".pdf", "")
+        docs.append(Entity(
+            id=f"doc:{k}", type=EntityType.DOCUMENT, label=label,
+            mentions=[E.Mention(item_id=it.id, text=label)],
+        ))
     return docs
 
 
@@ -747,6 +866,12 @@ def _relations(items, people, orgs, locations, money, subevents, documents) -> l
     return edges
 
 
+def _mark_duplicates(items: list[SourceItem], dedup: DedupResult) -> None:
+    for it in items:
+        canon = dedup.canonical.get(it.id)
+        it.duplicate_of = canon if (canon and canon != it.id) else None
+
+
 def _as_utc(dt):
     from datetime import timezone
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
@@ -756,7 +881,8 @@ def _timeline(subevents: list[Entity], items: list[SourceItem]) -> list[dict]:
     itemmap = {it.id: it for it in items}
     rows = []
     for se in subevents:
-        ts = [_as_utc(itemmap[i].timestamp) for i in se.item_ids if itemmap.get(i) and itemmap[i].timestamp]
+        ts = [_as_utc(itemmap[i].timestamp) for i in se.item_ids
+              if itemmap.get(i) and itemmap[i].timestamp]
         if not ts:
             continue
         ts_sorted = sorted(ts)

@@ -1,9 +1,8 @@
 """Currency detection for extracted amounts.
 
-The event archive mixes currencies (a USD conference invoice, EUR on-trip spend,
-bare INR numbers in WhatsApp). We must NOT assume a currency: an amount is only
-labeled with one when the source text carries an explicit symbol/code/word next
-to it. Otherwise it is flagged `needs_review` for the user to resolve.
+Amounts without an explicit symbol/code/word are flagged `needs_review`.
+Supports US format (1,234.56), European format (1.234,56), and Indian
+lakh format (1,00,000). Never assumes a currency.
 """
 from __future__ import annotations
 
@@ -19,10 +18,33 @@ _WORDS = [
     (r"\binr\b", "INR"), (r"\brs\.?\b", "INR"), (r"\brupees?\b", "INR"),
     (r"\bnok\b", "NOK"), (r"\bkr\b", "NOK"), (r"\bkroner?\b", "NOK"),
     (r"\bgbp\b", "GBP"), (r"\bpounds?\b", "GBP"),
-    (r"\bjpy\b", "JPY"),
+    (r"\bjpy\b", "JPY"), (r"\byen\b", "JPY"),
+    (r"\bkrw\b", "KRW"), (r"\bwon\b", "KRW"),
+    (r"\bcad\b", "CAD"), (r"\baud\b", "AUD"), (r"\bchf\b", "CHF"),
 ]
-SYMBOL_OF = {"USD": "$", "EUR": "€", "GBP": "£", "INR": "₹", "KRW": "₩", "JPY": "¥", "NOK": "kr"}
+SYMBOL_OF = {
+    "USD": "$", "EUR": "€", "GBP": "£", "INR": "₹",
+    "KRW": "₩", "JPY": "¥", "NOK": "kr",
+    "CAD": "CA$", "AUD": "A$", "CHF": "CHF ",
+}
 KNOWN = list(SYMBOL_OF.keys())
+
+
+def normalize_amount(text: str) -> float | None:
+    """Parse amount from US (1,234.56), European (1.234,56) or plain text."""
+    t = text.strip().replace(" ", "")
+    # European: ends with ,dd or has pattern .ddd,dd
+    if re.search(r",\d{2}$", t) and "." in t:
+        # 1.234,56 → 1234.56
+        t = t.replace(".", "").replace(",", ".")
+    elif re.search(r",\d{2}$", t):
+        t = t.replace(",", ".")
+    else:
+        t = t.replace(",", "")
+    try:
+        return float(t)
+    except ValueError:
+        return None
 
 
 def detect_currency(text: str) -> tuple[str | None, str]:

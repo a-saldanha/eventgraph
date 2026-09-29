@@ -95,7 +95,7 @@ def test_surface_variant_profiles_merge_into_one_person_entity():
         "person:10": {"person:10", "person:11"},
     }
 
-    result = _apply_profile_merges_to_people(
+    result, _ = _apply_profile_merges_to_people(
         [p_jon, p_jonathan], [ep1, ep2], merged_groups, owner_label=None,
     )
 
@@ -191,7 +191,7 @@ def test_owner_stays_single_entity_after_profile_merge():
         "person:22": {"person:22"},
     }
 
-    result = _apply_profile_merges_to_people(
+    result, _ = _apply_profile_merges_to_people(
         [owner_entity, other_entity],
         [ep_owner, ep_owner2, ep_other],
         merged_groups,

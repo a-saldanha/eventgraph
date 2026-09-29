@@ -1,0 +1,26 @@
+# Distinctive terms from the real archive.
+# The agnosticism test fails if any of these appear in app/, frontend/ or prompts.
+# One term per line; lines starting with # are comments.
+# Add terms that are specific enough to break demo generality if hardcoded.
+ICCV
+NeurIPS
+CVPR
+ECCV
+ICML
+EasyChair
+HotCRP
+OpenReview
+PaperCept
+CMT
+ConfMaster
+EDAS
+Rohan
+Menezes
+Srinivasa
+visa_timeline
+trip_cost
+conference trip
+paper submission
+camera-ready
+camera ready
+rebuttal

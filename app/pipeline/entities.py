@@ -19,14 +19,12 @@ from ..schema import SourceItem, normalize_text
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-@]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 _MONEY_RE = re.compile(r"\$\s?([0-9][0-9,]*\.[0-9]{2})")
 
-# Generic subevent keywords — no corpus-specific names or places.
+# Generic subevent keywords — no corpus-specific names, places, or event types.
 _SUBEVENT_KEYWORDS: dict[str, list[str]] = {
-    "Acceptance": ["accept", "acceptance", "camera-ready", "camera ready"],
-    "Rebuttal": ["rebuttal"],
+    "Acceptance": ["accept", "acceptance", "submission", "notification"],
     "Registration & Payment": ["registration", "register", "invoice", "receipt", "payment"],
-    "Visa": ["visa"],
-    "Flights": ["flight", "boarding", "itinerary", "airline"],
-    "Accommodation": ["airbnb", "accommodation", "hotel", "check-in"],
+    "Travel": ["flight", "boarding", "itinerary", "airline", "visa", "passport"],
+    "Accommodation": ["airbnb", "accommodation", "hotel", "check-in", "hostel"],
     "Presentation": ["presentation", "poster", "badge", "session", "workshop"],
 }
 

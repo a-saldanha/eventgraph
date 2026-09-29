@@ -31,25 +31,50 @@ class UnsupportedUpload(ValueError):
     pass
 
 
-def parse_upload(filename: str, data: bytes) -> list[SourceItem]:
+def sniff_format(data: bytes, ext: str) -> str:
+    """Detect actual file format from content, overriding extension when needed."""
+    head = data[:2048]
+    try:
+        head_str = head.decode("utf-8", errors="replace")
+    except Exception:
+        head_str = ""
+
+    # mbox: starts with "From " followed by an email address
+    if re.match(r"From \S+@\S+", head_str) or head_str.startswith("From nobody"):
+        return "mbox"
+    # eml: has RFC-822 headers (From:/To:/Date: near the top)
+    if re.search(r"^(From|To|Date|Subject|MIME-Version):", head_str, re.MULTILINE) and ext != ".mbox":
+        if head_str[:4] != "From":
+            return "eml"
+    # WhatsApp: timestamp pattern at start of lines
+    if re.search(r"^\[?\d{1,2}/\d{1,2}/\d{2,4}[,\s]", head_str, re.MULTILINE):
+        return "whatsapp"
+    # CSV: first line has multiple commas or tabs and looks like a header
+    if ext in (".csv", ".tsv") or (head_str.count(",") > 3 and "\n" in head_str):
+        return "csv"
+    return ext.lstrip(".") or "text"
+
+
+def parse_upload(filename: str, data: bytes) -> tuple[list[SourceItem], str]:
+    """Parse uploaded file into SourceItems. Returns (items, detected_format)."""
     ext = Path(filename).suffix.lower()
+    fmt = sniff_format(data, ext)
+
     if ext == ".md":
-        return _from_markdown(filename, data)
-    if ext == ".txt":
-        return _from_whatsapp_txt(filename, data)
-    if ext == ".eml":
-        return _from_eml(filename, data, index=1)
-    if ext == ".mbox":
-        return _from_mbox(filename, data)
+        return _from_markdown(filename, data), "markdown"
+    if fmt == "mbox" or ext == ".mbox":
+        return _from_mbox(filename, data), "mbox"
+    if fmt == "eml" or ext == ".eml":
+        return _from_eml(filename, data, index=1), "eml"
+    if fmt == "whatsapp" or ext == ".txt":
+        return _from_whatsapp_txt(filename, data), "whatsapp"
     if ext == ".pdf":
-        return _from_pdf(filename, data)
-    if ext == ".csv":
-        return _from_csv(filename, data)
+        return _from_pdf(filename, data), "pdf"
+    if fmt == "csv" or ext == ".csv":
+        return _from_csv(filename, data), "csv"
     if ext in BINARY_UNSUPPORTED:
         raise UnsupportedUpload(f"{ext} files need an OCR/spreadsheet stage that isn't wired yet.")
-    # Unknown text format: keep the whole file as one item; a later optional LLM
-    # step can fill participants, validated like any other LLM output.
-    return _from_text(filename, data)
+    return _from_text(filename, data), "text"
 
 
 # ---- PDF via LlamaParse ---------------------------------------------------

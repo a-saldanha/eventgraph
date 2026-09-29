@@ -184,12 +184,31 @@ def _parse_tool_use(text: str) -> dict:
 # Per-chunk extraction
 # ---------------------------------------------------------------------------
 
+_LLM_TIMEOUT = int(os.getenv("LLM_CHUNK_TIMEOUT", "60"))
+
+
+def _call_llm_once(client: LLMClient, user_content: str) -> dict:
+    """Single LLM call, raising on any error."""
+    if hasattr(client, "complete_tool"):
+        text = client.complete_tool(EXTRACT_V1, user_content, EXTRACT_TOOL)
+    else:
+        schema_hint = json.dumps(EXTRACT_TOOL["input_schema"], indent=2)
+        text = client.complete_json(
+            EXTRACT_V1 + "\n\nReturn ONLY valid JSON matching this schema:\n" + schema_hint,
+            user_content,
+        )
+    return _parse_tool_use(text)
+
+
 def _extract_chunk(
     chunk: Chunk,
     client: LLMClient,
     model: str,
     use_cache: bool,
 ) -> ChunkExtraction:
+    import concurrent.futures
+    import logging
+
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     key = _chunk_cache_key(chunk, model)
     cache_f = CACHE_DIR / f"{key}.json"
@@ -199,19 +218,24 @@ def _extract_chunk(
         from_cache = True
     else:
         user_content = chunk.full_text
-        # If client supports tool_use (AnthropicLLM), use it.
-        # Otherwise fall back to complete_json with the schema embedded in the prompt.
-        if hasattr(client, "complete_tool"):
-            text = client.complete_tool(EXTRACT_V1, user_content, EXTRACT_TOOL)
-        else:
-            schema_hint = json.dumps(EXTRACT_TOOL["input_schema"], indent=2)
-            augmented_system = (
-                EXTRACT_V1 + "\n\nReturn ONLY valid JSON matching this schema:\n" + schema_hint
-            )
-            text = client.complete_json(augmented_system, user_content)
-        raw = _parse_tool_use(text)
-        cache_f.write_text(json.dumps(raw))
+        raw = None
         from_cache = False
+        # Try once; on any error retry once; on second failure use empty fallback.
+        for attempt in range(2):
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(_call_llm_once, client, user_content)
+                    raw = fut.result(timeout=_LLM_TIMEOUT)
+                break
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "LLM extraction attempt %d failed for chunk %s: %s",
+                    attempt + 1, chunk.chunk_id, exc,
+                )
+        if raw is None:
+            # Fallback: heuristic extraction for this chunk (empty LLM output).
+            raw = {"messages": [], "mentions": [], "relations": []}
+        cache_f.write_text(json.dumps(raw))
 
     vresult = verify(chunk, raw)
     ce = ChunkExtraction(

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .ingest.adapters import UnsupportedUpload, parse_upload
+from .ingest.report import FileResult, IngestReport
 from .pipeline.build import build_graph
 from .schema import SourceItem
 from .limits import JOB_EVICT_SECS, JOB_MAX
@@ -88,16 +89,31 @@ class JobManager:
         job.status = "running"
         try:
             items: list[SourceItem] = []
+            ingest_report = IngestReport()
             self._emit(job, "parsing", f"Reading {len(files)} file(s)…")
             for name, data in files:
                 try:
-                    parsed = parse_upload(name, data)
+                    parsed, fmt = parse_upload(name, data)
                     items.extend(parsed)
-                    self._emit(job, "parsing", f"  {name}: {len(parsed)} items")
+                    warnings: list[str] = []
+                    status = "ok" if parsed else "partial"
+                    ingest_report.files.append(FileResult(
+                        name=name, detected_format=fmt,
+                        status=status, items=len(parsed), warnings=warnings,
+                    ))
+                    self._emit(job, "parsing", f"  {name} [{fmt}]: {len(parsed)} items")
                 except UnsupportedUpload as e:
+                    ingest_report.files.append(FileResult(
+                        name=name, detected_format="unsupported",
+                        status="skipped", error=str(e),
+                    ))
                     self._emit(job, "skipped", f"  {name}: {e}")
                 except Exception as e:
-                    self._emit(job, "skipped", f"  {name}: failed ({type(e).__name__})")
+                    ingest_report.files.append(FileResult(
+                        name=name, detected_format="unknown",
+                        status="failed", error=f"{type(e).__name__}: {e}",
+                    ))
+                    self._emit(job, "warning", f"  {name}: parse error — {type(e).__name__}: {e}")
 
             if not items:
                 job.error = "No parseable items in the uploaded files."
@@ -114,6 +130,7 @@ class JobManager:
             bundle = build_graph(
                 items, mode=mode,
                 progress=lambda stage, msg: self._emit(job, stage, msg),
+                ingest_report=ingest_report,
             )
             self._on_bundle(bundle, session_id)
             job.result_stats = bundle.stats

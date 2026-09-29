@@ -28,8 +28,8 @@ const PROBLEMS = [
 
 const FEATURES = [
   { tab: "Graph", icon: "◈", title: "Explore the graph", body: "People, orgs, places, money and sub-events, linked by who-paid-whom and who-talked-to-whom. Search, focus a node, walk its connections." },
-  { tab: "Timeline", icon: "▤", title: "Follow the timeline", body: "The event unfolding across sub-events — acceptance, rebuttal, visa, flights, registration, presentation — with date ranges." },
-  { tab: "Queries", icon: "❓", title: "Ask anything", body: "Natural-language questions answered over the graph, plus preset cross-source joins (trip cost, visa timeline, correspondents) — every answer cites its sources." },
+  { tab: "Timeline", icon: "▤", title: "Follow the timeline", body: "The event unfolding across topic episodes — with date ranges, item counts, and links to the underlying messages." },
+  { tab: "Queries", icon: "❓", title: "Ask anything", body: "Natural-language questions answered by navigating the graph, plus preset cross-source joins — every answer cites its sources." },
   { tab: "Corpus", icon: "▦", title: "Browse the corpus", body: "All source items, marked relevant or noise, filterable by channel and conversation. Click any fact through to the raw message." },
   { tab: "Resolution", icon: "⧉", title: "See the resolution", body: "The entity merges the system made and the reason for each — the cross-source identity work, made visible and auditable." },
   { tab: "Ingest", icon: "⬆", title: "Ingest new sources", body: "Drop in more files (email, WhatsApp, mbox, PDFs) and rebuild the graph, heuristically or with the LLM extractor." },

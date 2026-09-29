@@ -70,7 +70,8 @@ def test_corrupt_file_in_batch_does_not_block_the_others():
     parsed, errors = [], []
     for name, data in files:
         try:
-            parsed += parse_upload(name, data)
+            items, _fmt = parse_upload(name, data)
+            parsed += items
         except UnsupportedUpload as e:
             errors.append((name, str(e)))
     assert len(parsed) == 1 and parsed[0].sender_display
