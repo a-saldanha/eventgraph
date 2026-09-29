@@ -27,8 +27,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 CORPUS_DEFAULT = ROOT / "processed_data"
-CACHE_DIR = ROOT / ".cache" / "llm"
 BUNDLE_DEFAULT = ROOT / ".cache" / "bundle.json"
+
+# Honour DATA_DIR for the LLM cache (same logic as app/llm/extract.py).
+import os as _os
+_DATA_DIR = _os.getenv("DATA_DIR")
+CACHE_DIR = Path(_DATA_DIR) / "cache" / "llm" if _DATA_DIR else ROOT / ".cache" / "llm"
 
 # Approximate output tokens per chunk (mentions + relations + topics).
 _EST_OUTPUT_TOKENS_PER_CHUNK = 800
@@ -38,10 +42,40 @@ _OUTPUT_PRICE_PER_MT = 4.00
 
 
 def load_items(input_dir: Path):
+    """Load SourceItems from a directory.
+
+    Accepts two layouts:
+    - Legacy batch*.md files (the redacted markdown format used in processed_data/)
+    - Native exports: .mbox, .eml, .txt, .csv, .tsv, .xlsx, .pdf (raw/ on the volume)
+
+    Native files are parsed with the same parse_upload() used by the upload endpoint,
+    so the pipeline is identical to what a user experiences when replaying the upload.
+    """
     from app.ingest.markdown import parse_batch_file
+    from app.ingest.adapters import parse_upload, UnsupportedUpload
+
     items = []
-    for f in sorted(input_dir.glob("batch*.md")):
-        items += parse_batch_file(f)
+
+    batch_files = sorted(input_dir.glob("batch*.md"))
+    if batch_files:
+        for f in batch_files:
+            items += parse_batch_file(f)
+        return items
+
+    # Native export files
+    native_exts = {".mbox", ".eml", ".txt", ".csv", ".tsv", ".xlsx", ".pdf"}
+    native_files = sorted(f for f in input_dir.iterdir()
+                          if f.is_file() and f.suffix.lower() in native_exts)
+    for f in native_files:
+        try:
+            parsed, fmt = parse_upload(f.name, f.read_bytes())
+            items += parsed
+            print(f"  {f.name}: {len(parsed)} items ({fmt})")
+        except UnsupportedUpload as e:
+            print(f"  {f.name}: skipped — {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"  {f.name}: error — {e}", file=sys.stderr)
+
     return items
 
 

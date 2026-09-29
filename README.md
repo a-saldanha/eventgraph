@@ -11,7 +11,7 @@ trip owner surfaces as `R0h@n`, `Rohan Menezes`, `Menezes Rohan` and **four** em
 addresses, and the same registration email exists both as a standalone `.eml` and inside
 a Gmail mbox. See [decisions.md](decisions.md) for the full design rationale.
 
-Corpus (redacted): **1,482 items** — 1,139 WhatsApp, 296 calendar rows, 40 emails, 7 PDFs.
+Corpus: **1,482 items** — 1,139 WhatsApp, 296 calendar rows, 40 emails, 7 PDFs.
 
 ---
 
@@ -82,9 +82,8 @@ the deterministic heuristic path (`MockLLM`). Ingesting raw PDFs additionally ne
 - **Extraction:** `claude-sonnet-4-6` (batched + cached in `.cache/llm/`)
 - **NL query:** `claude-opus-4-8`
 
-## Privacy
+## Data
 
-The archive is real and redacted. Files holding un-redacted identities
-(`*.private.md`, `ENTITY_TRANSITION_MAP.txt`, `bundle.real.local.json`, `.cache.backup/`)
-are intentionally **not** part of this project and are gitignored. Only redacted
-`processed_data/` and the redacted `.cache/bundle.json` are included.
+The archive is the real, unredacted export from the event. It is served behind a site
+password and never committed to this repo. Raw files live on the Railway volume under
+`$DATA_DIR/raw/`; the built graph is at `$DATA_DIR/bundle.json`.

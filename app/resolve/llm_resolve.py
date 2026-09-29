@@ -27,7 +27,15 @@ from .profiles import Profile, profile_to_dict
 
 log = logging.getLogger(__name__)
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "resolve"
+def _resolve_cache_dir() -> Path:
+    import os as _os
+    data = _os.getenv("DATA_DIR")
+    if data:
+        return Path(data) / "cache" / "resolve"
+    return Path(__file__).resolve().parents[2] / ".cache" / "resolve"
+
+
+CACHE_DIR = _resolve_cache_dir()
 
 
 # ---------------------------------------------------------------------------

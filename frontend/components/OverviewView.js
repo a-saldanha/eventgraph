@@ -37,9 +37,9 @@ const FEATURES = [
 
 const ROADMAP = [
   "Postgres + Neo4j backing store (today it runs off a JSON snapshot)",
-  "Auth-gated cloud deploy over the redacted corpus",
   "OCR & spreadsheet ingestion — images and Excel calendars",
   "Tighter near-duplicate recall on reworded forwards",
+  "Multi-event support — each event gets its own graph and session",
 ];
 
 export default function OverviewView({ stats, onGo }) {
@@ -129,7 +129,7 @@ export default function OverviewView({ stats, onGo }) {
       </section>
 
       <footer className="land-foot">
-        Redacted for privacy · a bounded single-event demo · every fact grounded to its source.
+        A bounded single-event demo · every fact grounded to its source.
       </footer>
     </div>
   );

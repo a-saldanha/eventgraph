@@ -45,9 +45,8 @@ export default function IngestView({ onIngested }) {
     <div className="pad" style={{ maxWidth: 760 }}>
       <div className="section-h">Ingest files</div>
       <p className="snippet">
-        Supported: WhatsApp <b>.txt</b> exports, <b>.eml</b>, <b>.mbox</b>, redacted <b>.md</b> batches.
-        PDFs and spreadsheets are recognized; text is extracted where possible.
-        Uploads stay in your browser session for 30 minutes and are never stored.
+        Supported: WhatsApp <b>.txt</b> exports, <b>.eml</b>, <b>.mbox</b>, <b>.csv</b>, <b>.pdf</b>.
+        Upload up to 4 MB total. Files stay in your browser session for 30 minutes and are never stored permanently.
       </p>
 
       <div

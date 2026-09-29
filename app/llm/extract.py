@@ -25,7 +25,14 @@ from .chunking import Chunk, chunk_items
 from .prompts import EXTRACT_V1, EXTRACT_VERSION
 from .verify import verify, VerifyResult
 
-CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "llm"
+def _llm_cache_dir() -> Path:
+    data = os.getenv("DATA_DIR")
+    if data:
+        return Path(data) / "cache" / "llm"
+    return Path(__file__).resolve().parents[2] / ".cache" / "llm"
+
+
+CACHE_DIR = _llm_cache_dir()
 
 # ---------------------------------------------------------------------------
 # Tool-use schema (sent to the LLM as a tool definition).
