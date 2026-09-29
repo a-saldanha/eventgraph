@@ -30,6 +30,11 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "processed_data"
 DEMO_READONLY: bool = os.getenv("DEMO_READONLY", "").lower() in ("1", "true", "yes")
 _MAX_Q_LEN = 500
 
+# Simple hardcoded auth gate. Set APP_TOKEN=<secret> in env to enable.
+# All /api/* routes require "Authorization: Bearer <token>" when set.
+# Leave unset (or empty) to disable — handy for local dev.
+_APP_TOKEN: str | None = os.getenv("APP_TOKEN") or None
+
 STATE: dict[str, Bundle] = {}
 SESSION_STORE = SessionStore()
 RATE_LIMITER = RateLimiter()
@@ -63,6 +68,20 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=_cors_credentials,
 )
+
+
+@app.middleware("http")
+async def auth_gate(request: Request, call_next):
+    """Reject all /api/* calls unless the correct Bearer token is presented.
+
+    Skipped entirely when APP_TOKEN is not set (local dev default).
+    /api/health is always public so uptime monitors don't need the token.
+    """
+    if _APP_TOKEN and request.url.path.startswith("/api/") and request.url.path != "/api/health":
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {_APP_TOKEN}":
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+    return await call_next(request)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
