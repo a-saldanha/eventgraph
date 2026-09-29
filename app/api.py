@@ -279,6 +279,24 @@ async def session_reset():
     return resp
 
 
+@app.post("/api/seed-raw")
+async def seed_raw(files: list[UploadFile] = File(...)):
+    """Save uploaded files to DATA_DIR/raw/ so /api/replay can read them.
+
+    Called once from the operator's machine via curl — not exposed in the UI.
+    No size limit here (direct Railway URL, no Vercel proxy).
+    """
+    raw_dir = DATA_DIR / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for f in files:
+        data = await f.read()
+        dest = raw_dir / (f.filename or f.filename or "upload")
+        dest.write_bytes(data)
+        saved.append({"name": dest.name, "bytes": len(data)})
+    return {"ok": True, "saved": saved, "raw_dir": str(raw_dir)}
+
+
 @app.get("/api/health")
 def health():
     from .llm.client import llm_available
