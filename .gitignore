@@ -21,6 +21,11 @@ raw/
 .cache/
 .cache.backup/
 
+# corpus data — never commit; contains personal communications even when redacted.
+# Provide data/bundle.json to Railway via a persistent volume or railway run.
+data/
+processed_data/
+
 # local UI snapshots
 .backups/
 

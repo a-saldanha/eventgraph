@@ -48,14 +48,24 @@ _cors_credentials = _raw_origins != "*"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from . import store
+    import logging
+    log = logging.getLogger(__name__)
 
     saved = store.load_bundle()
     if saved is not None:
-        STATE["bundle"] = saved  # .cache/ or data/ — whichever is fresher
+        STATE["bundle"] = saved  # .cache/ or data/bundle.json — whichever is fresher
     else:
-        items = []  # first run: seed from committed corpus so the UI isn't empty
+        # No persisted bundle — try building from processed_data/ if it exists locally.
+        # On a clean deploy (no volume) this yields an empty graph, which is fine:
+        # the UI shows an upload prompt.
+        items = []
         for f in sorted(DATA_DIR.glob("batch*.md")):
             items += parse_batch_file(f)
+        if not items:
+            log.warning(
+                "No bundle and no corpus found — starting with an empty graph. "
+                "Upload files via the UI or mount data/bundle.json to populate the demo."
+            )
         STATE["bundle"] = build_graph(items)
     yield
 
