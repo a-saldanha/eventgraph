@@ -25,6 +25,15 @@ function buildHeaders(req) {
 
 async function proxy(req, context) {
   const { path } = await context.params;
+
+  // Admin endpoints are backend-internal only; the proxy never forwards them.
+  if (path[0] === "admin" || path.join("/").startsWith("admin/")) {
+    return new Response(JSON.stringify({ error: "not_found" }), {
+      status: 404,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
   const url = new URL(req.url);
   const target = `${BACKEND_URL}/api/${path.join("/")}${url.search}`;
 

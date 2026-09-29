@@ -221,32 +221,6 @@ JOBS = JobManager(on_bundle=_publish)
 
 # ── endpoints ──────────────────────────────────────────────────────────────────
 
-@app.post("/api/admin/seed-bundle")
-async def seed_bundle(file: UploadFile = File(...)):
-    """Write an uploaded bundle.json to DATA_DIR and hot-reload it.
-
-    One-time use: place your flagship bundle on the volume without needing
-    a container shell. Protected by BACKEND_TOKEN via the auth middleware.
-    """
-    from . import store as _store
-    contents = await file.read()
-    _store.DATA_BUNDLE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = _store.DATA_BUNDLE.with_suffix(".tmp")
-    tmp.write_bytes(contents)
-    tmp.replace(_store.DATA_BUNDLE)
-    bundle = _store._parse_bundle(_store.DATA_BUNDLE)
-    if bundle is None:
-        raise HTTPException(400, "Uploaded file is not a valid bundle.json")
-    STATE["bundle"] = bundle
-    global _BUNDLE_SOURCE
-    _BUNDLE_SOURCE = "data_dir"
-    return {
-        "status": "loaded",
-        "entities": len(bundle.graph.entities),
-        "items": len(bundle.items),
-        "path": str(_store.DATA_BUNDLE),
-    }
-
 
 @app.get("/api/health")
 def health():
