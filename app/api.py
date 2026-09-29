@@ -134,6 +134,31 @@ JOBS = JobManager(on_bundle=_publish)
 
 # ── endpoints ──────────────────────────────────────────────────────────────────
 
+@app.post("/api/admin/upload-bundle")
+async def upload_bundle(file: UploadFile = File(...)):
+    """One-time admin endpoint: upload a bundle.json to populate the demo graph.
+
+    Requires APP_TOKEN (handled by auth_gate middleware).
+    After upload the bundle is hot-reloaded — no restart needed.
+    """
+    from . import store as _store
+    contents = await file.read()
+    _store.DATA_BUNDLE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _store.DATA_BUNDLE.with_suffix(".tmp")
+    tmp.write_bytes(contents)
+    tmp.replace(_store.DATA_BUNDLE)
+
+    bundle = _store._parse_bundle(_store.DATA_BUNDLE)
+    if bundle is None:
+        raise HTTPException(400, "Uploaded file is not a valid bundle.json")
+    STATE["bundle"] = bundle
+    return {
+        "status": "loaded",
+        "entities": len(bundle.graph.entities),
+        "items": len(bundle.items),
+    }
+
+
 @app.get("/api/health")
 def health():
     from .llm.client import llm_available
