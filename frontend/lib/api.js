@@ -2,10 +2,28 @@
 // The proxy adds the backend auth token — no token is ever sent to the browser.
 export const API_BASE = "";
 
+// Slow-response notification: after 5 s without a reply, listeners are called with
+// `true`; on completion they are called with `false`. Page-level code subscribes to
+// show "Waking up the server…" while Railway cold-starts.
+const _slowListeners = new Set();
+export function onSlowResponse(fn) {
+  _slowListeners.add(fn);
+  return () => _slowListeners.delete(fn);
+}
+
 async function j(path) {
-  const r = await fetch(`${API_BASE}${path}`);
-  if (!r.ok) throw new Error(`${r.status}`);
-  return r.json();
+  let slowTimer = setTimeout(() => _slowListeners.forEach((f) => f(true)), 5000);
+  try {
+    const r = await fetch(`${API_BASE}${path}`);
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.message || `HTTP ${r.status}`);
+    }
+    return r.json();
+  } finally {
+    clearTimeout(slowTimer);
+    _slowListeners.forEach((f) => f(false));
+  }
 }
 
 export const api = {

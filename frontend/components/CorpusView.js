@@ -1,22 +1,25 @@
 "use client";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import ApiError from "@/components/ApiError";
 
 export default function CorpusView({ onSelectItem }) {
   const [data, setData] = useState({ items: [], total: 0 });
   const [filters, setFilters] = useState({ source_type: "", relevant: "", q: "" });
+  const [error, setError] = useState(null);
 
   const load = () => {
     const p = { limit: 200 };
     if (filters.source_type) p.source_type = filters.source_type;
     if (filters.relevant !== "") p.relevant = filters.relevant;
     if (filters.q) p.q = filters.q;
-    api.items(p).then(setData).catch(() => {});
+    api.items(p).then((d) => { setData(d); setError(null); }).catch((e) => setError(String(e)));
   };
   useEffect(() => { load(); /* eslint-disable-next-line */ }, [filters]);
 
   return (
     <div>
+      {error && <div className="pad"><ApiError message={error} onRetry={() => { setError(null); load(); }} /></div>}
       <div className="pad" style={{ display: "flex", gap: 8, alignItems: "center", borderBottom: "1px solid var(--border)" }}>
         <select value={filters.source_type} onChange={(e) => setFilters({ ...filters, source_type: e.target.value })}>
           <option value="">all sources</option>

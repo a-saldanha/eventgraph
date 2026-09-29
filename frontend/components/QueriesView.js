@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import ApiError from "@/components/ApiError";
 
 export default function QueriesView({ onSelectItem, onHighlight }) {
   const [queries, setQueries] = useState([]);
@@ -11,8 +12,9 @@ export default function QueriesView({ onSelectItem, onHighlight }) {
   const [answer, setAnswer] = useState(null);
   const [models, setModels] = useState(null);
 
+  const [loadError, setLoadError] = useState(null);
   useEffect(() => {
-    api.stats().then((s) => setQueries(s.queries || [])).catch(() => {});
+    api.stats().then((s) => setQueries(s.queries || [])).catch((e) => setLoadError(String(e)));
     api.models().then(setModels).catch(() => {});
   }, []);
 
@@ -40,6 +42,10 @@ export default function QueriesView({ onSelectItem, onHighlight }) {
 
   return (
     <div className="pad">
+      {loadError && <ApiError message={loadError} onRetry={() => {
+        setLoadError(null);
+        api.stats().then((s) => setQueries(s.queries || [])).catch((e) => setLoadError(String(e)));
+      }} />}
       <CurrencyReview onSelectItem={onSelectItem} />
 
       <div className="section-h">
@@ -127,7 +133,7 @@ export default function QueriesView({ onSelectItem, onHighlight }) {
 function CurrencyReview({ onSelectItem }) {
   const [data, setData] = useState(null);
   const [picked, setPicked] = useState({});
-  const load = () => api.currencyFlags().then(setData).catch(() => {});
+  const load = () => api.currencyFlags().then(setData).catch(() => { setData({ flagged: [] }); });
   useEffect(() => { load(); }, []);
   if (!data) return null;
 

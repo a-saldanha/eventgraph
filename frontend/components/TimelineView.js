@@ -1,11 +1,17 @@
 "use client";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import ApiError from "@/components/ApiError";
 
 export default function TimelineView({ onSelectEntity }) {
-  const [rows, setRows] = useState([]);
-  useEffect(() => { api.timeline().then(setRows).catch(() => {}); }, []);
-  if (!rows.length) return <div className="pad">Loading timeline…</div>;
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState(null);
+  const load = () => api.timeline().then(setRows).catch((e) => setError(String(e)));
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (error) return <div className="pad"><ApiError message={error} onRetry={() => { setError(null); load(); }} /></div>;
+  if (!rows) return <div className="pad">Loading timeline…</div>;
+  if (!rows.length) return <div className="pad">No timeline data found.</div>;
 
   const times = rows.flatMap((r) => [new Date(r.start), new Date(r.end)]);
   const min = Math.min(...times), max = Math.max(...times);

@@ -1,6 +1,7 @@
 "use client";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { api, pollJob } from "@/lib/api";
+import { useCallback, useEffect, useState } from "react";
+import { api, onSlowResponse, pollJob } from "@/lib/api";
+import ApiError from "@/components/ApiError";
 import GraphView from "@/components/GraphView";
 import TimelineView from "@/components/TimelineView";
 import CorpusView from "@/components/CorpusView";
@@ -18,6 +19,9 @@ export default function Page() {
   const [highlight, setHighlight] = useState([]);
   const [reloadKey, setReloadKey] = useState(0);
 
+  const [serverSlow, setServerSlow] = useState(false);
+  useEffect(() => onSlowResponse(setServerSlow), []);
+
   // "shared" = real archive, "replay" = viewer's replay, "upload" = viewer's upload
   const [dataset, setDataset] = useState("shared");
   const [hasReplay, setHasReplay] = useState(false);
@@ -29,11 +33,10 @@ export default function Page() {
   const [replayError, setReplayError] = useState(null);
   const [replayDone, setReplayDone] = useState(false);
 
-  const refresh = () => {
-    api.stats().then(setStats).catch(() => {});
-    setReloadKey((k) => k + 1);
-  };
-  useEffect(() => { api.stats().then(setStats).catch(() => {}); }, []);
+  const [statsError, setStatsError] = useState(null);
+  const loadStats = () => api.stats().then(setStats).catch((e) => setStatsError(String(e)));
+  const refresh = () => { loadStats(); setReloadKey((k) => k + 1); };
+  useEffect(() => { loadStats(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const selEntity = (id) => setSelection({ kind: "entity", id });
   const selItem = (id) => setSelection({ kind: "item", id });
@@ -86,6 +89,14 @@ export default function Page() {
 
   return (
     <div className="app">
+      {serverSlow && (
+        <div style={{
+          background: "#fffbe6", borderBottom: "1px solid #f0c060",
+          padding: "4px 14px", fontSize: 12, color: "#7a6000",
+        }}>
+          Waking up the server… (Railway cold-start takes up to 30 s on the first visit)
+        </div>
+      )}
       <div className="top">
         <span className="brand">EventGraph</span>
         <div className="tabs">
@@ -161,11 +172,14 @@ export default function Page() {
 
 function ResolutionView({ onSelectEntity }) {
   const [merges, setMerges] = useState([]);
-  useEffect(() => { api.merges().then(setMerges).catch(() => {}); }, []);
+  const [error, setError] = useState(null);
+  const load = () => api.merges().then(setMerges).catch((e) => setError(String(e)));
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <div className="pad">
       <div className="section-h">Entity resolution — {merges.length} merges (the hard sub-problem, made visible)</div>
       <p className="snippet">Each card is a set of distinct surface forms the system decided are the same real entity, with the reason. This is where duplicate identities across email + WhatsApp get unified.</p>
+      {error && <ApiError message={error} onRetry={() => { setError(null); load(); }} />}
       {merges.map((m) => (
         <div key={m.canonical_id} className="merge">
           <div><strong>{m.rationale}</strong> <span className="chip" onClick={() => onSelectEntity(m.canonical_id)}>open entity →</span></div>

@@ -23,7 +23,9 @@ export default function IngestView({
   const inputRef = useRef(null);
 
   useEffect(() => {
-    api.capabilities().then((c) => setLlmAvail(c.llm_available)).catch(() => {});
+    api.capabilities().then((c) => setLlmAvail(c.llm_available)).catch(() => {
+      // Treat as no LLM if capabilities endpoint fails (e.g. cold-start)
+    });
   }, []);
 
   const addFiles = (list) => {

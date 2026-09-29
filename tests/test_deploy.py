@@ -250,3 +250,40 @@ def test_ask_global_daily_cap_returns_429(demo_client, monkeypatch):
     assert r.status_code in (429, 503)
     if r.status_code == 429:
         assert "daily cap" in r.json()["message"].lower()
+
+
+# /api/items: duplicates must not cause 500
+
+def test_items_duplicate_items_do_not_cause_500(demo_client):
+    """/api/items must return 200 even when duplicate items exist in the bundle."""
+    r = demo_client.get("/api/items")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert "items" in data
+    assert "total" in data
+    # Every item row must have the expected fields (no KeyError → 500).
+    for row in data["items"]:
+        assert "id" in row
+        assert "relevant" in row
+        assert "duplicate_of" in row
+
+
+def test_items_duplicate_inherits_relevance(live_client, monkeypatch):
+    """A duplicate item must inherit its canonical's relevance verdict, not 500."""
+    import app.api as api_mod
+    import copy
+
+    bundle = copy.deepcopy(api_mod.STATE["bundle"])
+    # Mark the first item as a duplicate of the second, so it has no direct verdict.
+    if len(bundle.items) >= 2:
+        bundle.items[0] = bundle.items[0].model_copy(
+            update={"duplicate_of": bundle.items[1].id}
+        )
+        # Remove the first item from the relevance list to simulate the gap.
+        bundle.graph.relevance = [
+            v for v in bundle.graph.relevance if v.item_id != bundle.items[0].id
+        ]
+        api_mod.STATE["bundle"] = bundle
+
+    r = live_client.get("/api/items")
+    assert r.status_code == 200, r.text

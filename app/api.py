@@ -464,28 +464,44 @@ def items(
     offset: int = 0,
     b: Bundle = Depends(get_bundle),
 ):
+    # Build relevance map over canonical items; duplicates inherit canonical's verdict.
     rel = {v.item_id: v for v in b.graph.relevance}
+    for it in b.items:
+        if it.id not in rel and it.duplicate_of and it.duplicate_of in rel:
+            rel[it.id] = rel[it.duplicate_of]
+
     rows = b.items
     if source_type:
         rows = [it for it in rows if it.source_type.value == source_type]
     if conversation:
         rows = [it for it in rows if it.conversation_id == conversation]
     if relevant is not None:
-        rows = [it for it in rows if rel[it.id].relevant == relevant]
+        rows = [it for it in rows if rel.get(it.id) is not None
+                and rel[it.id].relevant == relevant]
     if q:
         ql = q.lower()
         rows = [it for it in rows if ql in it.body.lower() or ql in (it.subject or "").lower()]
     total = len(rows)
     page = rows[offset:offset + limit]
+
+    def _verdict(it):
+        v = rel.get(it.id)
+        if v is None:
+            return None, "not scored"
+        return v.relevant, v.rationale
+
     return {
         "total": total,
         "items": [
-            {"id": it.id, "source_type": it.source_type.value, "channel": it.channel,
-             "conversation_id": it.conversation_id,
-             "timestamp": it.timestamp.isoformat() if it.timestamp else None,
-             "sender": it.sender_display, "subject": it.subject,
-             "preview": it.body[:140],
-             "relevant": rel[it.id].relevant, "relevance_rationale": rel[it.id].rationale}
+            {
+                "id": it.id, "source_type": it.source_type.value, "channel": it.channel,
+                "conversation_id": it.conversation_id,
+                "timestamp": it.timestamp.isoformat() if it.timestamp else None,
+                "sender": it.sender_display, "subject": it.subject,
+                "preview": it.body[:140],
+                "duplicate_of": it.duplicate_of,
+                **dict(zip(("relevant", "relevance_rationale"), _verdict(it))),
+            }
             for it in page
         ],
     }

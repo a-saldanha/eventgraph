@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { api, TYPE_COLORS } from "@/lib/api";
+import ApiError from "@/components/ApiError";
 
 const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), { ssr: false });
 
@@ -9,15 +10,15 @@ const nid = (v) => (v && typeof v === "object" ? v.id : v);
 
 export default function GraphView({ onSelectEntity, highlight = [] }) {
   const [data, setData] = useState({ nodes: [], links: [] });
+  const [error, setError] = useState(null);
   const [size, setSize] = useState({ w: 800, h: 600 });
   const [q, setQ] = useState("");
   const [focus, setFocus] = useState(null); // locally-focused node id (from the list)
   const wrapRef = useRef(null);
   const fgRef = useRef(null);
 
-  useEffect(() => {
-    api.graph().then(setData).catch(() => {});
-  }, []);
+  const load = () => api.graph().then(setData).catch((e) => setError(String(e)));
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
@@ -81,6 +82,8 @@ export default function GraphView({ onSelectEntity, highlight = [] }) {
       fgRef.current.zoom(Math.max(2.5, fgRef.current.zoom()), 600);
     }
   };
+
+  if (error) return <div className="pad"><ApiError message={error} onRetry={() => { setError(null); load(); }} /></div>;
 
   return (
     <div ref={wrapRef} style={{ position: "absolute", inset: 0 }}>
