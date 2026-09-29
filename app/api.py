@@ -41,8 +41,9 @@ RATE_LIMITER = RateLimiter()
 
 _raw_origins = os.getenv("CORS_ORIGINS", "*")
 _cors_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-# Credentials cookies require explicit origins — can't combine with wildcard.
-_cors_credentials = _raw_origins != "*"
+# Browsers reject wildcard + credentials together; only enable credentials
+# when explicit origins are configured (i.e. production with a real domain).
+_cors_credentials = "*" not in _cors_origins
 
 
 @asynccontextmanager
@@ -87,7 +88,13 @@ async def auth_gate(request: Request, call_next):
     Skipped entirely when APP_TOKEN is not set (local dev default).
     /api/health is always public so uptime monitors don't need the token.
     """
-    if _APP_TOKEN and request.url.path.startswith("/api/") and request.url.path != "/api/health":
+    # Let CORS preflight through — the browser sends OPTIONS with no auth header.
+    if (
+        _APP_TOKEN
+        and request.method != "OPTIONS"
+        and request.url.path.startswith("/api/")
+        and request.url.path != "/api/health"
+    ):
         auth = request.headers.get("authorization", "")
         if auth != f"Bearer {_APP_TOKEN}":
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
