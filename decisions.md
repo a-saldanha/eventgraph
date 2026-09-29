@@ -355,3 +355,19 @@ AFTER Phase 4 (heuristic mode, no LLM):
   corpus-specific DOMAIN_ORG gazetteer was deleted. Locations = 0 (corpus-specific LOCATIONS
   gazetteer deleted). Isolated entities rose accordingly. These are expected, correct changes.
   31/31 tests green (24 existing + 7 new in tests/test_resolve_llm.py). No paid runs.
+
+---
+
+## v4 decisions
+
+### Dv4 — Single site password over the real data; no tiered access
+**Chose:** a single site-wide HMAC-signed cookie gate (Next.js edge middleware). Anyone
+with the password sees the real, unredacted archive with real names and message text.
+**Alternatives:** tiered access — a redacted public view for anonymous visitors plus
+an authenticated real-data view; per-user accounts with separate sessions.
+**Reasoning:** evaluators need the authentic experience — seeing redacted text alongside
+a query result breaks trust in the system. A two-tier approach adds significant scope
+(two pipeline paths, data governance for the public tier, review of every entity for
+leakage) that is not proportional to a 5-day build. A single password with a 7-day
+cookie is the right scope: the audience is a small, defined set of evaluators.
+**Cut:** per-user accounts, redaction pipeline, viewer roles, encryption at rest.
