@@ -1,26 +1,43 @@
-"""FastAPI app for the local mockup.
+"""FastAPI app for the EventGraph demo.
 
-Builds the whole EventGraph in memory on startup (no DB needed to view progress),
-and serves the corpus, graph, timeline, ER merge log, relevance verdicts, and a set
-of canned cross-source queries with citations + highlighted sub-graph.
+DEMO_READONLY=1 (env): the committed data/bundle.json is served read-only.
+Uploads in that mode build a session-scoped in-memory bundle (cookie session
+id, LRU+TTL) — never persisted, never replaces the shared demo graph.
+
+Normal mode: uploads replace the live bundle and are persisted to .cache/.
 """
 from __future__ import annotations
 
+import os
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from .ingest.markdown import parse_batch_file
 from .jobs import JobManager
 from .pipeline.build import Bundle, build_graph
 from . import queries as Q
+from .session_store import SessionStore
+from .rate_limit import RateLimiter
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "processed_data"
 
+DEMO_READONLY: bool = os.getenv("DEMO_READONLY", "").lower() in ("1", "true", "yes")
+_MAX_Q_LEN = 500
+
 STATE: dict[str, Bundle] = {}
+SESSION_STORE = SessionStore()
+RATE_LIMITER = RateLimiter()
+
+_raw_origins = os.getenv("CORS_ORIGINS", "*")
+_cors_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+# Credentials cookies require explicit origins — can't combine with wildcard.
+_cors_credentials = _raw_origins != "*"
 
 
 @asynccontextmanager
@@ -29,9 +46,9 @@ async def lifespan(app: FastAPI):
 
     saved = store.load_bundle()
     if saved is not None:
-        STATE["bundle"] = saved  # your last real ingest — no rebuild, no re-cost
+        STATE["bundle"] = saved  # .cache/ or data/ — whichever is fresher
     else:
-        items = []  # first run: seed the demo corpus so the UI isn't empty
+        items = []  # first run: seed from committed corpus so the UI isn't empty
         for f in sorted(DATA_DIR.glob("batch*.md")):
             items += parse_batch_file(f)
         STATE["bundle"] = build_graph(items)
@@ -39,24 +56,103 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="EventGraph", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=_cors_credentials,
+)
 
 
-def bundle() -> Bundle:
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+def _get_ip(request: Request) -> str:
+    ff = request.headers.get("x-forwarded-for")
+    if ff:
+        return ff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def get_bundle(
+    session_id: str | None = Cookie(None, alias="eventgraph_session"),
+) -> Bundle:
+    """FastAPI dependency: session bundle when present, else the demo/live bundle."""
+    if DEMO_READONLY and session_id:
+        sess = SESSION_STORE.get(session_id)
+        if sess is not None:
+            return sess  # type: ignore[return-value]
     return STATE["bundle"]
 
 
-def _publish(new_bundle: Bundle):
-    STATE["bundle"] = new_bundle
+def _publish(bundle: Bundle, session_id: str | None = None) -> None:
+    """Publish a freshly built bundle.
+
+    DEMO_READONLY: store under the session — never touch STATE or disk.
+    Normal: replace the live bundle and persist to .cache/.
+    """
+    if DEMO_READONLY:
+        if session_id:
+            SESSION_STORE.put(session_id, bundle)
+    else:
+        STATE["bundle"] = bundle
+        from . import store
+        store.save_bundle(bundle)
 
 
 JOBS = JobManager(on_bundle=_publish)
 
 
+# ── endpoints ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/health")
+def health():
+    from .llm.client import llm_available
+    from . import store as _store
+    b = STATE.get("bundle")
+    # Determine which bundle source was used at startup
+    if _store.SNAPSHOT.exists():
+        source = "local_cache"
+    elif _store.DATA_BUNDLE.exists():
+        source = "committed_data"
+    else:
+        source = "rebuilt"
+    return {
+        "status": "ok",
+        "demo_readonly": DEMO_READONLY,
+        "bundle_source": source,
+        "entities": len(b.graph.entities) if b else 0,
+        "items": len(b.items) if b else 0,
+        "llm_available": llm_available(),
+        "active_sessions": SESSION_STORE.count() if DEMO_READONLY else None,
+    }
+
+
 @app.post("/api/ingest")
-async def ingest(files: list[UploadFile] = File(...), mode: str = Query("heuristic")):
-    """Bulk upload → async pipeline. mode=heuristic (instant) | llm (uses the model)."""
+async def ingest(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    mode: str = Query("heuristic"),
+    session_id: str | None = Cookie(None, alias="eventgraph_session"),
+):
+    """Bulk upload → async pipeline. mode=heuristic (instant) | llm (uses the model).
+
+    In DEMO_READONLY mode the upload builds a session-scoped bundle and sets a
+    session cookie — the shared demo graph is never modified.
+    """
     payload = [(f.filename or "upload", await f.read()) for f in files]
+
+    if DEMO_READONLY:
+        if not session_id:
+            session_id = str(uuid.uuid4())
+        job = JOBS.start(payload, mode=mode, session_id=session_id)
+        resp = JSONResponse({"job_id": job.id, "n_files": len(payload)})
+        resp.set_cookie(
+            "eventgraph_session", session_id,
+            max_age=3600, samesite="lax", httponly=True,
+        )
+        return resp
+
     job = JOBS.start(payload, mode=mode)
     return {"job_id": job.id, "n_files": len(payload)}
 
@@ -64,7 +160,7 @@ async def ingest(files: list[UploadFile] = File(...), mode: str = Query("heurist
 @app.get("/api/capabilities")
 def capabilities():
     from .llm.client import llm_available
-    return {"llm_available": llm_available()}
+    return {"llm_available": llm_available(), "demo_readonly": DEMO_READONLY}
 
 
 @app.get("/api/jobs/{job_id}/events")
@@ -73,15 +169,13 @@ async def job_events(job_id: str):
 
 
 @app.get("/api/stats")
-def stats():
-    b = bundle()
+def stats(b: Bundle = Depends(get_bundle)):
     return {**b.stats, "queries": Q.list_queries()}
 
 
 @app.get("/api/graph")
-def graph(min_degree: int = 1):
+def graph(min_degree: int = 1, b: Bundle = Depends(get_bundle)):
     """Nodes + edges for visualization. Isolated low-signal nodes trimmed."""
-    b = bundle()
     deg: dict[str, int] = {}
     for e in b.graph.edges:
         deg[e.source] = deg.get(e.source, 0) + 1
@@ -105,8 +199,7 @@ def graph(min_degree: int = 1):
 
 
 @app.get("/api/entity/{entity_id}")
-def entity(entity_id: str):
-    b = bundle()
+def entity(entity_id: str, b: Bundle = Depends(get_bundle)):
     e = b.graph.entity(entity_id)
     if not e:
         raise HTTPException(404, "entity not found")
@@ -121,20 +214,25 @@ def entity(entity_id: str):
 
 
 @app.get("/api/merges")
-def merges():
-    return [m.model_dump() for m in bundle().graph.merges if len(m.merged_forms) > 1]
+def merges(b: Bundle = Depends(get_bundle)):
+    return [m.model_dump() for m in b.graph.merges if len(m.merged_forms) > 1]
 
 
 @app.get("/api/timeline")
-def timeline():
-    return bundle().timeline
+def timeline(b: Bundle = Depends(get_bundle)):
+    return b.timeline
 
 
 @app.get("/api/items")
-def items(source_type: str | None = None, relevant: bool | None = None,
-          conversation: str | None = None, q: str | None = None,
-          limit: int = Query(100, le=500), offset: int = 0):
-    b = bundle()
+def items(
+    source_type: str | None = None,
+    relevant: bool | None = None,
+    conversation: str | None = None,
+    q: str | None = None,
+    limit: int = Query(100, le=500),
+    offset: int = 0,
+    b: Bundle = Depends(get_bundle),
+):
     rel = {v.item_id: v for v in b.graph.relevance}
     rows = b.items
     if source_type:
@@ -163,8 +261,7 @@ def items(source_type: str | None = None, relevant: bool | None = None,
 
 
 @app.get("/api/item/{item_id}")
-def item(item_id: str):
-    b = bundle()
+def item(item_id: str, b: Bundle = Depends(get_bundle)):
     it = next((x for x in b.items if x.id == item_id), None)
     if not it:
         raise HTTPException(404, "item not found")
@@ -184,11 +281,9 @@ def item(item_id: str):
 
 
 @app.get("/api/flags/currency")
-def currency_flags():
-    """Amounts whose currency the system could NOT determine from the source — the
-    user resolves these; we never assume a currency."""
+def currency_flags(b: Bundle = Depends(get_bundle)):
+    """Amounts whose currency the system could NOT determine — user resolves these."""
     from .pipeline import currency as C
-    b = bundle()
     itemmap = {it.id: it for it in b.items}
     out = []
     for e in b.graph.entities:
@@ -208,12 +303,26 @@ def currency_flags():
 
 
 @app.post("/api/resolve/currency")
-def resolve_currency(entity_id: str = Query(...), currency: str = Query(...)):
-    """User resolves a flagged amount by assigning its real currency. Persisted."""
+def resolve_currency(
+    entity_id: str = Query(...),
+    currency: str = Query(...),
+    session_id: str | None = Cookie(None, alias="eventgraph_session"),
+    b: Bundle = Depends(get_bundle),
+):
+    """User resolves a flagged amount by assigning its real currency.
+
+    In DEMO_READONLY mode requires an active session (upload first).
+    """
     from .pipeline import currency as C
+
+    if DEMO_READONLY and not session_id:
+        raise HTTPException(
+            403,
+            "The demo graph is read-only. Upload your own files first to create a session.",
+        )
+
     if currency not in C.KNOWN:
         raise HTTPException(400, f"unknown currency {currency!r}; use one of {C.KNOWN}")
-    b = bundle()
     e = b.graph.entity(entity_id)
     if not e or e.type.value != "money":
         raise HTTPException(404, "money entity not found")
@@ -222,14 +331,18 @@ def resolve_currency(entity_id: str = Query(...), currency: str = Query(...)):
     e.label = C.label(e.attrs["amount"], e.attrs)
     for m in e.mentions:
         m.text = e.label
-    from . import store
-    store.save_bundle(b)
+
+    if DEMO_READONLY:
+        SESSION_STORE.put(session_id, b)  # type: ignore[arg-type]
+    else:
+        from . import store
+        store.save_bundle(b)
+
     return {"entity_id": entity_id, "label": e.label, "currency": currency}
 
 
 @app.get("/api/query/{query_id}")
-def run_query(query_id: str):
-    b = bundle()
+def run_query(query_id: str, b: Bundle = Depends(get_bundle)):
     try:
         return Q.run(query_id, b)
     except KeyError:
@@ -237,27 +350,40 @@ def run_query(query_id: str):
 
 
 @app.get("/api/ask")
-def ask(q: str = Query(..., min_length=2)):
-    """Free-form natural-language question answered by the smart LLM over the graph."""
+def ask(
+    request: Request,
+    q: str = Query(..., min_length=2, max_length=_MAX_Q_LEN),
+    b: Bundle = Depends(get_bundle),
+):
+    """Free-form natural-language question answered by the LLM over the graph.
+
+    Rate-limited: 10 questions/minute per IP, 200/day globally.
+    """
     from .llm.client import llm_available
     if not llm_available():
-        from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=503,
-            content={"error": "llm_unavailable", "message": "Free-form questions need an API key. The structured queries above still work."}
+            content={"error": "llm_unavailable",
+                     "message": "Free-form questions need an API key. The structured queries above still work."},
         )
+
+    ip = _get_ip(request)
+    allowed, reason = RATE_LIMITER.check(ip)
+    if not allowed:
+        return JSONResponse(status_code=429, content={"error": "rate_limited", "message": reason})
+
+    RATE_LIMITER.record(ip)
     from .query_llm import query_graph
-    return query_graph(q, bundle())
+    return query_graph(q, b)
 
 
 @app.get("/api/starter_questions")
-def starter_questions_endpoint():
-    return Q.starter_questions(bundle())
+def starter_questions_endpoint(b: Bundle = Depends(get_bundle)):
+    return Q.starter_questions(b)
 
 
 @app.get("/api/capabilities/models")
 def model_info():
-    import os
     return {
         "extraction_model": os.getenv("LLM_MODEL", "claude-sonnet-4-6"),
         "query_model": os.getenv("LLM_QUERY_MODEL", "claude-opus-4-8"),

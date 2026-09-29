@@ -32,12 +32,20 @@ class Job:
 class JobManager:
     def __init__(self, on_bundle: Callable):
         self._jobs: dict[str, Job] = {}
-        self._on_bundle = on_bundle  # called with the new Bundle to publish it
+        # on_bundle(bundle, session_id) — session_id is None in non-readonly mode
+        self._on_bundle = on_bundle
 
-    def start(self, files: list[tuple[str, bytes]], mode: str = "heuristic") -> Job:
+    def start(
+        self,
+        files: list[tuple[str, bytes]],
+        mode: str = "heuristic",
+        session_id: Optional[str] = None,
+    ) -> Job:
         job = Job(id=str(uuid.uuid4()))
         self._jobs[job.id] = job
-        threading.Thread(target=self._run, args=(job, files, mode), daemon=True).start()
+        threading.Thread(
+            target=self._run, args=(job, files, mode, session_id), daemon=True
+        ).start()
         return job
 
     def get(self, job_id: str) -> Optional[Job]:
@@ -46,7 +54,13 @@ class JobManager:
     def _emit(self, job: Job, stage: str, message: str):
         job.events.put({"stage": stage, "message": message, "ts": time.time()})
 
-    def _run(self, job: Job, files: list[tuple[str, bytes]], mode: str = "heuristic"):
+    def _run(
+        self,
+        job: Job,
+        files: list[tuple[str, bytes]],
+        mode: str = "heuristic",
+        session_id: Optional[str] = None,
+    ):
         try:
             items: list[SourceItem] = []
             self._emit(job, "parsing", f"Reading {len(files)} file(s)…")
@@ -71,9 +85,7 @@ class JobManager:
                        + (" (LLM — this calls the model per batch)" if mode == "llm" else ""))
             bundle = build_graph(items, mode=mode,
                                  progress=lambda stage, msg: self._emit(job, stage, msg))
-            self._on_bundle(bundle)
-            from . import store  # persist so a restart never loses this / re-charges
-            store.save_bundle(bundle)
+            self._on_bundle(bundle, session_id)
             job.result_stats = bundle.stats
             self._emit(job, "done",
                        f"Done — {bundle.stats['entities']} entities, "
