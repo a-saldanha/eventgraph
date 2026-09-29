@@ -1,15 +1,15 @@
 """LLM client behind one interface (Anthropic | mock).
 
-The pipeline never imports the vendor SDK directly — it calls `get_llm_client()`.
-This keeps the model swappable and lets tests / offline runs use the mock.
+The pipeline calls get_llm_client() / get_resolve_client() / get_query_client();
+it never imports the vendor SDK directly.
 
-Model IDs come exclusively from environment variables:
-  LLM_EXTRACT_MODEL  — extraction (cheap); default claude-haiku-4-5
-  LLM_RESOLVE_MODEL  — resolution;        default claude-sonnet-4-6
-  LLM_QUERY_MODEL    — NL query;          default claude-sonnet-4-6
+Three model variables (all overridable via env):
+  LLM_EXTRACT_MODEL  default claude-haiku-4-5
+  LLM_RESOLVE_MODEL  default claude-sonnet-4-6
+  LLM_QUERY_MODEL    default claude-sonnet-4-6
 
-Retry policy: 429 (rate limit), 5xx (server error), and connection errors use
-exponential backoff with jitter. All other 4xx errors fail fast (no retry).
+Retry policy: 429, 5xx, and connection errors use exponential backoff with jitter.
+Other 4xx errors fail fast.
 """
 from __future__ import annotations
 
@@ -155,18 +155,11 @@ def get_llm_client(model: str | None = None) -> LLMClient:
     Model resolution order:
       1. Explicit `model` argument.
       2. LLM_EXTRACT_MODEL env var.
-      3. LLM_MODEL env var (legacy).
-      4. Hard default 'claude-haiku-4-5' (cheapest).
-
-    Never hardcodes a model id — every default is overridable via env.
+      3. Hard default 'claude-haiku-4-5'.
     """
     provider = os.getenv("LLM_PROVIDER", "anthropic")
     if model is None:
-        model = (
-            os.getenv("LLM_EXTRACT_MODEL")
-            or os.getenv("LLM_MODEL")
-            or "claude-haiku-4-5"
-        )
+        model = os.getenv("LLM_EXTRACT_MODEL") or "claude-haiku-4-5"
     if provider == "mock":
         return MockLLM()
     key = _read_key()
@@ -176,14 +169,12 @@ def get_llm_client(model: str | None = None) -> LLMClient:
 
 
 def get_resolve_client() -> LLMClient:
-    """Smarter model for entity resolution (Phase 4)."""
-    model = os.getenv("LLM_RESOLVE_MODEL") or os.getenv("LLM_MODEL") or "claude-sonnet-4-6"
+    model = os.getenv("LLM_RESOLVE_MODEL") or "claude-sonnet-4-6"
     return get_llm_client(model)
 
 
 def get_query_client() -> LLMClient:
-    """Smarter model for answering natural-language questions."""
-    model = os.getenv("LLM_QUERY_MODEL") or os.getenv("LLM_MODEL") or "claude-sonnet-4-6"
+    model = os.getenv("LLM_QUERY_MODEL") or "claude-sonnet-4-6"
     return get_llm_client(model)
 
 

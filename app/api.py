@@ -1,14 +1,17 @@
 """FastAPI app for the EventGraph demo.
 
-DEMO_READONLY=1 (env): the committed data/bundle.json is served read-only.
-Uploads in that mode build a session-scoped in-memory bundle (cookie session
-id, LRU+TTL) — never persisted, never replaces the shared demo graph.
+DEMO_READONLY=1 (env): a committed or volume-mounted bundle.json is served read-only.
+Writes (currency resolution, review decisions) work on a per-visitor copy-on-write
+session — never the shared bundle.
 
 Normal mode: uploads replace the live bundle and are persisted to .cache/.
 """
 from __future__ import annotations
 
+import copy
+import hmac
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,50 +27,63 @@ from .pipeline.build import Bundle, build_graph
 from . import queries as Q
 from .session_store import SessionStore
 from .rate_limit import RateLimiter
+from .limits import (
+    MAX_FILES, MAX_FILE_BYTES, MAX_REQUEST_BYTES,
+    IP_MAX_INGESTS, IP_WINDOW_SECS,
+    LLM_MAX_PER_SESSION_HOUR, LLM_DAILY_CAP,
+)
 
-DATA_DIR = Path(__file__).resolve().parents[1] / "processed_data"
+DATA_DIR = Path(os.getenv("DATA_DIR", "")).resolve() if os.getenv("DATA_DIR") else \
+    Path(__file__).resolve().parents[1] / "data"
 
 DEMO_READONLY: bool = os.getenv("DEMO_READONLY", "").lower() in ("1", "true", "yes")
-_MAX_Q_LEN = 500
 
-# Simple hardcoded auth gate. Set APP_TOKEN=<secret> in env to enable.
-# All /api/* routes require "Authorization: Bearer <token>" when set.
-# Leave unset (or empty) to disable — handy for local dev.
-_APP_TOKEN: str | None = os.getenv("APP_TOKEN") or None
+# Set BACKEND_TOKEN=<secret> in env to require auth on every route except /api/health.
+# Leave unset (or empty) for local dev — auth gate is disabled.
+_BACKEND_TOKEN: str | None = os.getenv("BACKEND_TOKEN") or None
 
 STATE: dict[str, Bundle] = {}
+# Which source was actually loaded at startup — set by the lifespan.
+_BUNDLE_SOURCE: str = "empty"
+
 SESSION_STORE = SessionStore()
 RATE_LIMITER = RateLimiter()
 
-_raw_origins = os.getenv("CORS_ORIGINS", "*")
-_cors_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
-# Browsers reject wildcard + credentials together; only enable credentials
-# when explicit origins are configured (i.e. production with a real domain).
+# Sliding-window per-IP ingest rate tracker: ip -> list of timestamps
+_ingest_timestamps: dict[str, list[float]] = {}
+
+# LLM-build counters: global daily count and per-session last-build time
+_llm_daily_count: int = 0
+_llm_daily_date: str = ""
+_llm_session_last: dict[str, float] = {}
+
+_raw_origins = os.getenv("CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()] or ["*"]
 _cors_credentials = "*" not in _cors_origins
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _BUNDLE_SOURCE
     from . import store
     import logging
     log = logging.getLogger(__name__)
 
     saved = store.load_bundle()
     if saved is not None:
-        STATE["bundle"] = saved  # .cache/ or data/bundle.json — whichever is fresher
+        STATE["bundle"] = saved
+        _BUNDLE_SOURCE = store.LAST_SOURCE
     else:
-        # No persisted bundle — try building from processed_data/ if it exists locally.
-        # On a clean deploy (no volume) this yields an empty graph, which is fine:
-        # the UI shows an upload prompt.
         items = []
         for f in sorted(DATA_DIR.glob("batch*.md")):
             items += parse_batch_file(f)
         if not items:
             log.warning(
                 "No bundle and no corpus found — starting with an empty graph. "
-                "Upload files via the UI or mount data/bundle.json to populate the demo."
+                "Place bundle.json in DATA_DIR or mount a Railway volume."
             )
         STATE["bundle"] = build_graph(items)
+        _BUNDLE_SOURCE = "rebuilt" if items else "empty"
     yield
 
 
@@ -83,20 +99,20 @@ app.add_middleware(
 
 @app.middleware("http")
 async def auth_gate(request: Request, call_next):
-    """Reject all /api/* calls unless the correct Bearer token is presented.
+    """Require Bearer BACKEND_TOKEN on all /api/* routes except /api/health.
 
-    Skipped entirely when APP_TOKEN is not set (local dev default).
-    /api/health is always public so uptime monitors don't need the token.
+    Disabled when BACKEND_TOKEN is not set (local dev default).
+    CORS preflight (OPTIONS) passes through unconditionally.
     """
-    # Let CORS preflight through — the browser sends OPTIONS with no auth header.
     if (
-        _APP_TOKEN
+        _BACKEND_TOKEN
         and request.method != "OPTIONS"
         and request.url.path.startswith("/api/")
         and request.url.path != "/api/health"
     ):
         auth = request.headers.get("authorization", "")
-        if auth != f"Bearer {_APP_TOKEN}":
+        expected = f"Bearer {_BACKEND_TOKEN}"
+        if not hmac.compare_digest(auth, expected):
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
     return await call_next(request)
 
@@ -113,7 +129,7 @@ def _get_ip(request: Request) -> str:
 def get_bundle(
     session_id: str | None = Cookie(None, alias="eventgraph_session"),
 ) -> Bundle:
-    """FastAPI dependency: session bundle when present, else the demo/live bundle."""
+    """Return the session bundle when present, otherwise the shared bundle."""
     if DEMO_READONLY and session_id:
         sess = SESSION_STORE.get(session_id)
         if sess is not None:
@@ -124,8 +140,8 @@ def get_bundle(
 def _publish(bundle: Bundle, session_id: str | None = None) -> None:
     """Publish a freshly built bundle.
 
-    DEMO_READONLY: store under the session — never touch STATE or disk.
-    Normal: replace the live bundle and persist to .cache/.
+    DEMO_READONLY: store under the session. Never touch STATE or disk.
+    Normal mode: replace the live bundle and persist to .cache/.
     """
     if DEMO_READONLY:
         if session_id:
@@ -136,17 +152,81 @@ def _publish(bundle: Bundle, session_id: str | None = None) -> None:
         store.save_bundle(bundle)
 
 
+def _cow_session(session_id: str | None) -> tuple[Bundle, str]:
+    """Return (session_bundle, session_id), creating a CoW copy if needed.
+
+    In DEMO_READONLY mode any write that doesn't have an active session gets
+    its own deep copy of the shared bundle, so visitors can resolve currencies
+    or accept merges without uploading first.
+    """
+    if session_id:
+        sess = SESSION_STORE.get(session_id)
+        if sess is not None:
+            return sess, session_id  # type: ignore[return-value]
+    # No active session — create one from the shared bundle.
+    sid = session_id or str(uuid.uuid4())
+    bundle_copy = copy.deepcopy(STATE["bundle"])
+    SESSION_STORE.put(sid, bundle_copy)
+    return bundle_copy, sid
+
+
+def _check_ingest_rate(ip: str) -> tuple[bool, str]:
+    now = time.time()
+    window = now - IP_WINDOW_SECS
+    times = [t for t in _ingest_timestamps.get(ip, []) if t > window]
+    _ingest_timestamps[ip] = times
+    if len(times) >= IP_MAX_INGESTS:
+        return False, (
+            f"Too many uploads from this IP ({IP_MAX_INGESTS} per "
+            f"{IP_WINDOW_SECS // 60} minutes). Try again later."
+        )
+    return True, ""
+
+
+def _record_ingest(ip: str) -> None:
+    _ingest_timestamps.setdefault(ip, []).append(time.time())
+
+
+def _check_llm_quota(session_id: str | None) -> tuple[bool, str]:
+    global _llm_daily_count, _llm_daily_date
+    import datetime
+    today = datetime.date.today().isoformat()
+    if _llm_daily_date != today:
+        _llm_daily_count = 0
+        _llm_daily_date = today
+    if _llm_daily_count >= LLM_DAILY_CAP:
+        return False, (
+            f"Daily LLM-build cap ({LLM_DAILY_CAP}) reached. "
+            "Use Instant mode instead."
+        )
+    if session_id:
+        last = _llm_session_last.get(session_id, 0)
+        if time.time() - last < 3600 / LLM_MAX_PER_SESSION_HOUR:
+            return False, (
+                "LLM mode is limited to 1 build per hour per session. "
+                "Use Instant mode or wait."
+            )
+    return True, ""
+
+
+def _record_llm_build(session_id: str | None) -> None:
+    global _llm_daily_count
+    _llm_daily_count += 1
+    if session_id:
+        _llm_session_last[session_id] = time.time()
+
+
 JOBS = JobManager(on_bundle=_publish)
 
 
 # ── endpoints ──────────────────────────────────────────────────────────────────
 
-@app.post("/api/admin/upload-bundle")
-async def upload_bundle(file: UploadFile = File(...)):
-    """One-time admin endpoint: upload a bundle.json to populate the demo graph.
+@app.post("/api/admin/seed-bundle")
+async def seed_bundle(file: UploadFile = File(...)):
+    """Write an uploaded bundle.json to DATA_DIR and hot-reload it.
 
-    Requires APP_TOKEN (handled by auth_gate middleware).
-    After upload the bundle is hot-reloaded — no restart needed.
+    One-time use: place your flagship bundle on the volume without needing
+    a container shell. Protected by BACKEND_TOKEN via the auth middleware.
     """
     from . import store as _store
     contents = await file.read()
@@ -154,15 +234,17 @@ async def upload_bundle(file: UploadFile = File(...)):
     tmp = _store.DATA_BUNDLE.with_suffix(".tmp")
     tmp.write_bytes(contents)
     tmp.replace(_store.DATA_BUNDLE)
-
     bundle = _store._parse_bundle(_store.DATA_BUNDLE)
     if bundle is None:
         raise HTTPException(400, "Uploaded file is not a valid bundle.json")
     STATE["bundle"] = bundle
+    global _BUNDLE_SOURCE
+    _BUNDLE_SOURCE = "data_dir"
     return {
         "status": "loaded",
         "entities": len(bundle.graph.entities),
         "items": len(bundle.items),
+        "path": str(_store.DATA_BUNDLE),
     }
 
 
@@ -171,17 +253,10 @@ def health():
     from .llm.client import llm_available
     from . import store as _store
     b = STATE.get("bundle")
-    # Determine which bundle source was used at startup
-    if _store.SNAPSHOT.exists():
-        source = "local_cache"
-    elif _store.DATA_BUNDLE.exists():
-        source = "committed_data"
-    else:
-        source = "rebuilt"
     return {
         "status": "ok",
         "demo_readonly": DEMO_READONLY,
-        "bundle_source": source,
+        "bundle_source": _BUNDLE_SOURCE,
         "entities": len(b.graph.entities) if b else 0,
         "items": len(b.items) if b else 0,
         "llm_available": llm_available(),
@@ -196,12 +271,51 @@ async def ingest(
     mode: str = Query("heuristic"),
     session_id: str | None = Cookie(None, alias="eventgraph_session"),
 ):
-    """Bulk upload → async pipeline. mode=heuristic (instant) | llm (uses the model).
+    """Bulk upload → async pipeline. Returns a job_id to poll."""
+    ip = _get_ip(request)
 
-    In DEMO_READONLY mode the upload builds a session-scoped bundle and sets a
-    session cookie — the shared demo graph is never modified.
-    """
-    payload = [(f.filename or "upload", await f.read()) for f in files]
+    # Per-IP rate limit
+    allowed, reason = _check_ingest_rate(ip)
+    if not allowed:
+        return JSONResponse(status_code=429, content={"error": "rate_limited", "message": reason})
+
+    # File count limit
+    if len(files) > MAX_FILES:
+        return JSONResponse(
+            status_code=413,
+            content={"error": "too_many_files",
+                     "message": f"Upload at most {MAX_FILES} files per request."},
+        )
+
+    # Read and validate each file
+    payload: list[tuple[str, bytes]] = []
+    total_bytes = 0
+    for f in files:
+        data = await f.read()
+        if len(data) > MAX_FILE_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "file_too_large",
+                         "message": f"{f.filename!r} exceeds the {MAX_FILE_BYTES // (1024*1024)} MB per-file limit."},
+            )
+        total_bytes += len(data)
+        if total_bytes > MAX_REQUEST_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={"error": "request_too_large",
+                         "message": f"Total upload exceeds {MAX_REQUEST_BYTES // (1024*1024)} MB. Split across requests."},
+            )
+        payload.append((f.filename or "upload", data))
+
+    # LLM-mode quota
+    if mode == "llm":
+        ok, reason = _check_llm_quota(session_id)
+        if not ok:
+            return JSONResponse(status_code=429, content={"error": "llm_quota", "message": reason})
+
+    _record_ingest(ip)
+    if mode == "llm":
+        _record_llm_build(session_id)
 
     if DEMO_READONLY:
         if not session_id:
@@ -210,12 +324,32 @@ async def ingest(
         resp = JSONResponse({"job_id": job.id, "n_files": len(payload)})
         resp.set_cookie(
             "eventgraph_session", session_id,
-            max_age=3600, samesite="lax", httponly=True,
+            max_age=1800, samesite="lax", httponly=True,
         )
         return resp
 
     job = JOBS.start(payload, mode=mode)
     return {"job_id": job.id, "n_files": len(payload)}
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str):
+    """Poll a job's current state and full event history."""
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "unknown job")
+    return {
+        "status": job.status,
+        "events": job.events,
+        "stats": job.result_stats,
+        "error": job.error,
+    }
+
+
+@app.get("/api/jobs/{job_id}/events")
+async def job_events(job_id: str):
+    """SSE stream — kept for local dev. UI uses /api/jobs/{id} polling instead."""
+    return EventSourceResponse(JOBS.stream(job_id))
 
 
 @app.get("/api/capabilities")
@@ -224,9 +358,13 @@ def capabilities():
     return {"llm_available": llm_available(), "demo_readonly": DEMO_READONLY}
 
 
-@app.get("/api/jobs/{job_id}/events")
-async def job_events(job_id: str):
-    return EventSourceResponse(JOBS.stream(job_id))
+@app.get("/api/capabilities/models")
+def model_info():
+    return {
+        "extract_model": os.getenv("LLM_EXTRACT_MODEL", "claude-haiku-4-5"),
+        "resolve_model": os.getenv("LLM_RESOLVE_MODEL", "claude-sonnet-4-6"),
+        "query_model": os.getenv("LLM_QUERY_MODEL", "claude-sonnet-4-6"),
+    }
 
 
 @app.get("/api/stats")
@@ -236,20 +374,21 @@ def stats(b: Bundle = Depends(get_bundle)):
 
 @app.get("/api/graph")
 def graph(min_degree: int = 1, b: Bundle = Depends(get_bundle)):
-    """Nodes + edges for visualization. Isolated low-signal nodes trimmed."""
     deg: dict[str, int] = {}
     for e in b.graph.edges:
         deg[e.source] = deg.get(e.source, 0) + 1
         deg[e.target] = deg.get(e.target, 0) + 1
     keep = {
         e.id for e in b.graph.entities
-        if deg.get(e.id, 0) >= min_degree or e.type.value in ("subevent", "org", "location", "money", "document")
+        if deg.get(e.id, 0) >= min_degree
+        or e.type.value in ("subevent", "org", "location", "money", "document")
     }
     nodes = [
         {"id": e.id, "label": e.label, "type": e.type.value,
          "mentions": len(e.mentions), "degree": deg.get(e.id, 0),
          "emails": e.attrs.get("emails", []),
-         "currency": e.attrs.get("currency"), "needs_review": e.attrs.get("needs_review", False)}
+         "currency": e.attrs.get("currency"),
+         "needs_review": e.attrs.get("needs_review", False)}
         for e in b.graph.entities if e.id in keep
     ]
     links = [
@@ -335,7 +474,7 @@ def item(item_id: str, b: Bundle = Depends(get_bundle)):
         "timestamp": it.timestamp.isoformat() if it.timestamp else None,
         "sender": it.sender_display, "recipients": it.recipients_display,
         "participants": [p.model_dump() for p in it.participants],
-        "subject": it.subject, "body": it.body, "notes": it.notes,
+        "subject": it.subject, "body": it.body,
         "relevance": rel.model_dump() if rel else None,
         "entities": ents,
     }
@@ -343,7 +482,7 @@ def item(item_id: str, b: Bundle = Depends(get_bundle)):
 
 @app.get("/api/flags/currency")
 def currency_flags(b: Bundle = Depends(get_bundle)):
-    """Amounts whose currency the system could NOT determine — user resolves these."""
+    """Amounts whose currency the system could not determine — user resolves these."""
     from .pipeline import currency as C
     itemmap = {it.id: it for it in b.items}
     out = []
@@ -357,7 +496,8 @@ def currency_flags(b: Bundle = Depends(get_bundle)):
                 srcs.append({"item_id": m.item_id, "source_type": it.source_type.value,
                              "snippet": (it.body[:140]).strip()})
         out.append({"entity_id": e.id, "amount": e.attrs.get("amount"),
-                    "reason": "mixed-currency" if e.attrs.get("currency_ambiguous") else "no-currency-marker",
+                    "reason": "mixed-currency" if e.attrs.get("currency_ambiguous")
+                    else "no-currency-marker",
                     "evidence": e.attrs.get("currency_evidence", []), "sources": srcs})
     out.sort(key=lambda x: -(x["amount"] or 0))
     return {"currencies": C.KNOWN, "flagged": out}
@@ -365,28 +505,31 @@ def currency_flags(b: Bundle = Depends(get_bundle)):
 
 @app.post("/api/resolve/currency")
 def resolve_currency(
+    request: Request,
     entity_id: str = Query(...),
     currency: str = Query(...),
     session_id: str | None = Cookie(None, alias="eventgraph_session"),
-    b: Bundle = Depends(get_bundle),
 ):
-    """User resolves a flagged amount by assigning its real currency.
+    """Assign a currency to a flagged amount.
 
-    In DEMO_READONLY mode requires an active session (upload first).
+    In DEMO_READONLY mode, the write goes to a per-visitor copy of the bundle.
+    Visitors without a session get one automatically — no upload required.
     """
     from .pipeline import currency as C
 
-    if DEMO_READONLY and not session_id:
-        raise HTTPException(
-            403,
-            "The demo graph is read-only. Upload your own files first to create a session.",
-        )
-
     if currency not in C.KNOWN:
         raise HTTPException(400, f"unknown currency {currency!r}; use one of {C.KNOWN}")
+
+    if DEMO_READONLY:
+        b, sid = _cow_session(session_id)
+    else:
+        b = STATE["bundle"]
+        sid = None
+
     e = b.graph.entity(entity_id)
     if not e or e.type.value != "money":
         raise HTTPException(404, "money entity not found")
+
     e.attrs.update({"currency": currency, "currency_resolved": True,
                     "currency_ambiguous": False, "needs_review": False, "resolved_by": "user"})
     e.label = C.label(e.attrs["amount"], e.attrs)
@@ -394,12 +537,19 @@ def resolve_currency(
         m.text = e.label
 
     if DEMO_READONLY:
-        SESSION_STORE.put(session_id, b)  # type: ignore[arg-type]
+        SESSION_STORE.put(sid, b)
     else:
         from . import store
         store.save_bundle(b)
 
-    return {"entity_id": entity_id, "label": e.label, "currency": currency}
+    resp = JSONResponse({"entity_id": entity_id, "label": e.label, "currency": currency})
+    if DEMO_READONLY and sid != session_id:
+        is_secure = request.url.scheme == "https"
+        resp.set_cookie(
+            "eventgraph_session", sid,
+            max_age=1800, samesite="lax", httponly=True, secure=is_secure,
+        )
+    return resp
 
 
 @app.get("/api/query/{query_id}")
@@ -410,22 +560,26 @@ def run_query(query_id: str, b: Bundle = Depends(get_bundle)):
         raise HTTPException(404, "unknown query")
 
 
+_MAX_Q_LEN = 500
+
+
 @app.get("/api/ask")
 def ask(
     request: Request,
     q: str = Query(..., min_length=2, max_length=_MAX_Q_LEN),
     b: Bundle = Depends(get_bundle),
 ):
-    """Free-form natural-language question answered by the LLM over the graph.
+    """Free-form question answered by the LLM over the graph.
 
-    Rate-limited: 10 questions/minute per IP, 200/day globally.
+    Rate-limited: per-IP and global daily cap.
     """
     from .llm.client import llm_available
     if not llm_available():
         return JSONResponse(
             status_code=503,
             content={"error": "llm_unavailable",
-                     "message": "Free-form questions need an API key. The structured queries above still work."},
+                     "message": "Free-form questions need an API key. "
+                     "The structured queries still work."},
         )
 
     ip = _get_ip(request)
@@ -441,11 +595,3 @@ def ask(
 @app.get("/api/starter_questions")
 def starter_questions_endpoint(b: Bundle = Depends(get_bundle)):
     return Q.starter_questions(b)
-
-
-@app.get("/api/capabilities/models")
-def model_info():
-    return {
-        "extraction_model": os.getenv("LLM_MODEL", "claude-sonnet-4-6"),
-        "query_model": os.getenv("LLM_QUERY_MODEL", "claude-opus-4-8"),
-    }

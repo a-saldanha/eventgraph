@@ -159,15 +159,26 @@ def test_health_live_mode(live_client):
     assert r.json()["demo_readonly"] is False
 
 
-# read-only: currency resolve without session → 403
+# read-only: currency resolve without session → CoW copy created, shared bundle unchanged
 
-def test_readonly_currency_resolve_no_session_returns_403(demo_client):
+def test_readonly_currency_resolve_no_session_creates_cow_session(demo_client):
+    import app.api as api_mod
+    import json
+
+    shared_json = json.dumps(
+        api_mod.STATE["bundle"].graph.model_dump(mode="json"), sort_keys=True
+    )
+    # Use a money entity that may or may not exist; 404 is acceptable, 500 is not.
     r = demo_client.post(
         "/api/resolve/currency",
         params={"entity_id": "money:0", "currency": "INR"},
     )
-    assert r.status_code == 403
-    assert "read-only" in r.json()["detail"].lower()
+    assert r.status_code in (200, 404), f"Unexpected status {r.status_code}"
+    # Shared bundle must be unchanged regardless.
+    after_json = json.dumps(
+        api_mod.STATE["bundle"].graph.model_dump(mode="json"), sort_keys=True
+    )
+    assert shared_json == after_json
 
 
 # read-only: demo bundle not contaminated after session upload
